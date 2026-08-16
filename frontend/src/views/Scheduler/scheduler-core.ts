@@ -1,0 +1,1906 @@
+// @ts-nocheck
+import { getSchedulerState, saveSchedulerState } from '@/api/scheduler'
+import html2canvas from 'html2canvas'
+
+let keydownHandler: ((e: KeyboardEvent) => void) | null = null
+let mouseupHandler: ((e: MouseEvent) => void) | null = null
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+let syncing = false
+const UNDO_LIMIT = 50
+let undoStack: string[] = []
+
+export function initScheduler() {
+/* =========================================================
+   Shifts, staff defaults, HK holidays 2026
+   ========================================================= */
+let SHIFTS = {
+  AD: { label:"全",  hours: 0,  time: "24h 全天候",   desc: "全天候值守（Leader / on-call）", bg:"#1f2937", fg:"#ffffff" },
+  E:  { label:"早",  hours: 9,  time: "06:00–15:00",  desc: "工作日 早班",                     bg:"#dbeafe", fg:"#1e3a8a" },
+  N:  { label:"正",  hours: 9,  time: "09:30–18:30",  desc: "工作日 正常班",                   bg:"#fde68a", fg:"#78530f" },
+  M:  { label:"中",  hours: 9,  time: "14:00–23:00",  desc: "工作日 中班",                     bg:"#c7d2fe", fg:"#312e81" },
+  L:  { label:"晚",  hours: 9,  time: "22:00–07:00",  desc: "工作日 晚班",                     bg:"#a5b4fc", fg:"#1e1b4b" },
+  WE: { label:"早W", hours: 12, time: "06:00–18:00",  desc: "周末/假日 早班 12h",              bg:"#fecaca", fg:"#7f1d1d" },
+  WL: { label:"晚W", hours: 12, time: "18:00–06:00",  desc: "周末/假日 晚班 12h",              bg:"#818cf8", fg:"#ffffff" },
+  SB: { label:"SB", hours: 0,  time: "Standby",       desc: "备班 (不算工作、算休息)",         bg:"#fef9c3", fg:"#713f12" },
+  AL: { label:"AL", hours: 0,  time: "年假",           desc: "Annual Leave（全天，不占周休名额）",  bg:"#fbcfe8", fg:"#831843" },
+  HAM:{ label:"AM½",hours: 0,  time: "上午半 AL",       desc: "上午半天年假（已停用，保留渲染历史数据）", bg:"#fce7f3", fg:"#9d174d" },
+  HAP:{ label:"PM½",hours: 0,  time: "下午半 AL",       desc: "下午半天年假（已停用，保留渲染历史数据）", bg:"#fbcfe8", fg:"#831843" },
+  HAL:{ label:"½AL",hours: 0,  time: "半天年假",       desc: "半天年假（未指定上/下午）",           bg:"#fce7f3", fg:"#9d174d" },
+  MAL:{ label:"婚", hours: 0,  time: "婚假",           desc: "Marriage Leave（婚假）",              bg:"#ffe4e6", fg:"#9f1239" },
+  AAL:{ label:"额", hours: 0,  time: "额外假",         desc: "Additional Leave（额外假）",          bg:"#fef3c7", fg:"#92400e" },
+  LV: { label:"休", hours: 0,  time: "周休",           desc: "每周应休（标记正常周休 2 天中的一天）", bg:"#d1fae5", fg:"#065f46" },
+  OFF:{ label:"離", hours: 0,  time: "離港",           desc: "離港",                            bg:"#fed7aa", fg:"#7c2d12" },
+  TO: { label:"补", hours: 0,  time: "补休",           desc: "使用补休假",                      bg:"#bbf7d0", fg:"#14532d" },
+  NA: { label:"停", hours: 0,  time: "不排班",         desc: "该日不参与排班（可置灰/暂停）",   bg:"#e5e4e0", fg:"#78766e" },
+};
+let SHIFT_ORDER = ["AD","E","N","M","L","WE","WL","SB","AL","HAL","LV","OFF","TO","NA"];
+// Cell cycle order (empty -> ...)
+const CYCLE = ["", ...SHIFT_ORDER];
+// Keyboard shortcuts to shift code
+const KEY_TO_SHIFT = { "0":"AD","1":"E","2":"N","3":"M","4":"L","5":"WE","6":"WL","7":"SB","a":"AL","o":"OFF","r":"TO","s":"SB","h":"LV","x":"NA" };
+
+// Which shifts count a day as "上班日"
+const ON_DUTY = new Set(["AD","E","N","M","L","WE","WL"]);
+// Shifts that mean "not participating" — excluded from weekly rest quota calculations
+const NON_PARTICIPATING = new Set(["AL","HAL","MAL","AAL","LV","OFF","TO","NA"]);
+// AL family — 年假类型，独立于周休名额（分子和分母都不算进周休硬性指标）
+const AL_FAMILY = new Set(["AL","HAL","MAL","AAL"]);
+// Which shifts count as "周休 (rest credit)" for the 上5休2 audit
+// AL 家族 = 独立年假，不算周休；SB 备班算休；空档不算（必须明确标记）
+// 周休标记：LV「休」 · SB「备班」 · OFF「離」 · TO「补」 · NA「停」
+const REST_CREDIT = { LV:1, SB:1, OFF:1, TO:1, NA:1 };
+
+// Factory defaults snapshotted immediately (never mutate)
+const DEFAULT_SHIFTS_SNAPSHOT = JSON.parse(JSON.stringify(SHIFTS));
+const DEFAULT_SHIFT_ORDER_SNAPSHOT = SHIFT_ORDER.slice();
+
+const DEFAULT_STAFF = [
+  { id:"isaac",    name:"Isaac Cheng",     role:"Leader",         group:"LEAD",  fixed:"AD",   allowed: ["E","N","M","L","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"], note:"默认排全天候班（可改）", exempt:false },
+  { id:"andy",     name:"Andy Long",       role:"API 支持",       group:"API",   fixed:"N",    allowed: ["N","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL","SB"], note:"固定正常班 09:30–18:30", exempt:false },
+  { id:"stephanie",name:"Stephanie Lai",   role:"开户组 ＋ 客服", group:"A",     pair:"mula",  allowed: ["E","N","M","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"], note:"组 A · 与 Mula 替早", exempt:false, fixed:"N" },
+  { id:"mula",     name:"Mula Chan",       role:"开户组 ＋ 客服", group:"A",     pair:"stephanie", allowed: ["E","N","M","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"], note:"组 A · 与 Stephanie 替早", exempt:false, fixed:"N" },
+  { id:"kelvin",   name:"Kelvin Pang",     role:"基础运营 ＋ 客服", group:"B",   pair:"rex",   allowed: ["E","N","M","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"], note:"组 B · 与 Rex 替中", exempt:false, fixed:"N", startDate:"2025-07-07" },
+  { id:"rex",      name:"Rex Lee",         role:"基础运营",       group:"B",     pair:"kelvin",allowed: ["E","N","M","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"], note:"组 B · 与 Kelvin 替中", exempt:false, fixed:"N" },
+  { id:"penny",    name:"Penny Peng",      role:"客服",           group:"FLEX",  allowed: ["L","M","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL","N"], note:"灵活班", exempt:false, fixed:"AD", startDate:"2026-07-27" },
+  { id:"sloane",   name:"Sloane Yin",      role:"客服",           group:"FLEX",  allowed: ["E","N","M","L","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"], note:"灵活班", exempt:false, fixed:"AD", startDate:"2026-08-03" },
+  { id:"darrell",  name:"Ternence Wong",   role:"客服",           group:"FLEX",  allowed: ["E","N","M","L","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"], note:"灵活班", exempt:false, startDate:"2026-08-12", fixed:"AD" },
+];
+
+// HK 公众假期 2026（用于计入 12h 周末班规则）
+const HK_HOLIDAYS_2026 = new Set([
+  "2026-01-01","2026-02-17","2026-02-18","2026-02-19","2026-04-03",
+  "2026-04-04","2026-04-06","2026-04-30","2026-05-01","2026-05-24",
+  "2026-05-25","2026-06-19","2026-07-01","2026-09-26","2026-10-01",
+  "2026-10-19","2026-12-25","2026-12-26"
+]);
+// 简易 2025 假期（跨年可能用到）
+const HK_HOLIDAYS_2025 = new Set([
+  "2025-01-01","2025-01-29","2025-01-30","2025-01-31","2025-04-04",
+  "2025-04-18","2025-04-19","2025-04-21","2025-05-01","2025-05-05",
+  "2025-05-31","2025-07-01","2025-10-01","2025-10-07","2025-10-29",
+  "2025-12-25","2025-12-26"
+]);
+function isHoliday(dateStr){
+  return HK_HOLIDAYS_2026.has(dateStr) || HK_HOLIDAYS_2025.has(dateStr);
+}
+function isWeekend(d){ const w = d.getDay(); return w === 0 || w === 6; }
+function isRestDay(dateStr, d){ return isWeekend(d) || isHoliday(dateStr); }
+
+// Parse "HH:MM–HH:MM" (or with -, ~, 到, 至) and return hours, handling cross-midnight.
+function parseTimeToHours(str){
+  if(!str) return null;
+  const m = str.match(/(\d{1,2})[:：](\d{2})\s*[–—~\-~到至]\s*(\d{1,2})[:：](\d{2})/);
+  if(!m) return null;
+  const h1 = +m[1], mi1 = +m[2], h2 = +m[3], mi2 = +m[4];
+  if(h1>23 || h2>23 || mi1>59 || mi2>59) return null;
+  let start = h1*60 + mi1;
+  let end   = h2*60 + mi2;
+  if(end <= start) end += 24*60; // cross-midnight
+  return Math.round((end - start) / 60 * 100) / 100;
+}
+
+// Person "active" on a given date? Considers exempt flag + startDate/endDate range.
+function isPersonActive(p, dateStr){
+  if(!p) return false;
+  if(p.exempt) return false;
+  if(p.startDate && dateStr < p.startDate) return false;
+  if(p.endDate   && dateStr > p.endDate)   return false;
+  return true;
+}
+function inactiveReason(p, dateStr){
+  if(p.exempt) return "不参与排班";
+  if(p.startDate && dateStr < p.startDate) return `${p.startDate} 起入职`;
+  if(p.endDate   && dateStr > p.endDate)   return `${p.endDate} 后离职`;
+  return "";
+}
+
+/* =========================================================
+   Storage
+   ========================================================= */
+const LS_KEY = "cs-roster-v1";
+// ==========================================================================
+// SEED_STATE — 首次打开时的默认排班数据（浏览器 localStorage 空时才生效）
+// 每次工具升级时会带上用户当前最新的排班快照；已有 localStorage 数据不会被覆盖。
+// 用户可通过工具栏「重置」按钮手动清空 localStorage 回到 seed。
+// ==========================================================================
+const SEED_STATE = {"months":{"2026-08":{"andy":{"3":"AD","4":"AD","5":"AD","6":"AD","7":"AD","8":"LV","9":"LV","10":"AD","11":"AD","12":"AD","13":"AD","14":"AD","15":"LV","16":"LV","17":"AD","18":"AD","19":"AD","20":"AD","21":"AD","22":"LV","23":"SB","24":"AD","25":"AD","26":"AD","27":"AD","28":"AD","29":"LV","30":"SB","31":"AD"},"isaac":{"3":"AD","4":"AD","5":"AD","6":"AD","7":"AD","8":"SB","9":"SB","10":"AD","11":"AD","12":"AD","13":"AD","14":"AD","15":"LV","16":"SB","17":"AD","18":"AD","19":"AD","20":"AD","21":"AD","22":"LV","23":"LV","24":"AD","25":"AD","26":"AD","27":"AD","28":"AD","29":"SB","30":"LV","31":"AD"},"stephanie":{"3":"N","4":"N","5":"N","6":"N","7":"N","8":"LV","9":"SB","10":"N","11":"N","12":"N","13":"N","14":"N","15":"LV","16":"LV","17":"N","18":"N","19":"N","20":"N","21":"N","22":"LV","23":"LV","24":"E","25":"E","26":"N","27":"AL","28":"AL","29":"OFF","30":"OFF","31":"AL"},"penny":{"3":"N","4":"N","5":"N","6":"N","7":"N","8":"LV","9":"LV","10":"L","11":"L","12":"L","13":"L","14":"L","15":"LV","16":"LV","17":"L","18":"L","19":"L","20":"L","21":"L","22":"LV","23":"LV","24":"L","25":"L","26":"L","27":"L","28":"L","29":"LV","30":"LV","31":"L"},"sloane":{"3":"N","4":"N","5":"N","6":"N","7":"N","8":"LV","9":"LV","10":"N","11":"N","12":"N","13":"N","14":"LV","15":"M","16":"M","17":"LV","18":"LV","19":"M","20":"M","21":"M","22":"M","23":"M","24":"LV","25":"LV","26":"M","27":"M","28":"M","29":"M","30":"M","31":"LV"},"darrell":{"12":"N","13":"N","14":"N","15":"E","16":"E","17":"LV","18":"LV","19":"N","20":"N","21":"N","22":"E","23":"E","24":"LV","25":"LV","26":"E","27":"E","28":"E","29":"E","30":"E","31":"LV"},"mula":{"3":"N","4":"N","5":"N","6":"N","7":"N","8":"LV","9":"LV","10":"HAM","11":"HAM","12":"N","13":"N","14":"N","15":"SB","16":"LV","17":"N","18":"N","19":"N","20":"N","21":"AL","22":"OFF","23":"OFF","24":"N","25":"N","26":"N","27":"N","28":"N","29":"LV","30":"LV","31":"E"},"c-c":{"31":"NA"},"kelvin":{"3":"N","4":"N","5":"N","6":"N","7":"HAP","8":"LV","9":"LV","10":"N","11":"N","12":"N","13":"N","14":"N","15":"LV","16":"LV","17":"N","18":"N","19":"N","20":"N","21":"N","22":"SB","23":"LV","24":"M","25":"M","26":"N","27":"N","28":"N","29":"LV","30":"LV","31":"N"},"rex":{"3":"N","4":"N","5":"N","6":"N","7":"N","8":"SB","9":"LV","10":"N","11":"N","12":"N","13":"N","14":"N","15":"LV","16":"LV","17":"M","18":"M","19":"N","20":"N","21":"N","22":"LV","23":"LV","24":"N","25":"N","26":"N","27":"N","28":"N","29":"LV","30":"LV","31":"N"},"n1785816915081":{"17":"N","18":"N","19":"N","20":"N","21":"N","22":"LV","23":"LV","24":"N","25":"N","26":"N","27":"N","28":"LV","29":"L","30":"L","31":"LV"}}},"staff":[{"id":"isaac","name":"Isaac Cheng","role":"Leader","group":"LEAD","exempt":false,"allowed":["E","N","M","L","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"],"note":"默认排全天候班（可改）","fixed":"AD"},{"id":"andy","name":"Andy Long","role":"API 支持","group":"API","fixed":"N","allowed":["N","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL","SB"],"note":"固定正常班 09:30–18:30","exempt":false},{"id":"stephanie","name":"Stephanie Lai","role":"开户组 ＋ 客服","group":"A","pair":"mula","allowed":["E","N","M","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"],"note":"组 A · 与 Mula 替早","exempt":false,"fixed":"N"},{"id":"mula","name":"Mula Chan","role":"开户组 ＋ 客服","group":"A","pair":"stephanie","allowed":["E","N","M","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"],"note":"组 A · 与 Stephanie 替早","exempt":false,"fixed":"N"},{"id":"kelvin","name":"Kelvin Pang","role":"基础运营 ＋ 客服","group":"B","pair":"rex","allowed":["E","N","M","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"],"note":"组 B · 与 Rex 替中","exempt":false,"fixed":"N","startDate":"2025-07-07"},{"id":"rex","name":"Rex Lee","role":"基础运营","group":"B","pair":"kelvin","allowed":["E","N","M","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"],"note":"组 B · 与 Kelvin 替中","exempt":false,"fixed":"N"},{"id":"penny","name":"Penny Peng","role":"客服","group":"FLEX","allowed":["L","M","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL","N"],"note":"灵活班","exempt":false,"fixed":"AD","startDate":"2026-07-27"},{"id":"sloane","name":"Sloane Yin","role":"客服","group":"FLEX","allowed":["E","N","M","L","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"],"note":"灵活班","exempt":false,"fixed":"AD","startDate":"2026-08-03"},{"id":"darrell","name":"Ternence Wong","role":"客服","group":"FLEX","allowed":["E","N","M","L","WE","WL","SB","AL","OFF","TO","AD","LV","NA","HAL","MAL","AAL"],"note":"灵活班","exempt":false,"startDate":"2026-08-12","fixed":"AD"}],"config":{}};
+
+function loadState(){
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if(raw){
+      const s = JSON.parse(raw);
+      if(!s.months) s.months = {};
+      return s;
+    }
+  } catch {}
+  // localStorage empty → seed with baked-in default so opening the tool fresh already has your latest roster
+  console.info("[CS Roster] No local data; seeding from bundled SEED_STATE (month:", Object.keys(SEED_STATE.months||{}).join(","), ")");
+  return JSON.parse(JSON.stringify(SEED_STATE));
+}
+function saveState(){
+  localStorage.setItem(LS_KEY, JSON.stringify(state));
+  if (syncing) return;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveSchedulerState(state).catch(() => {});
+  }, 800);
+}
+let state = loadState();
+if(!state.staff) state.staff = JSON.parse(JSON.stringify(DEFAULT_STAFF));
+// Migration: previous version hard-coded Isaac as exempt.
+for(const p of state.staff){
+  if(p.exempt){
+    p.exempt = false;
+    if(!p.fixed) p.fixed = "AD";
+    if(!p.note || p.note.includes("不参与排班")) p.note = "默认排全天候班（可改）";
+  }
+  // Ensure common non-work leave/rest shifts are in every person's allowed list — anyone can be given a rest/leave shift
+  for(const code of ["AD","SB","LV","NA","HAL","AL","OFF","TO"]){
+    if(p.allowed && !p.allowed.includes(code)) p.allowed.push(code);
+  }
+}
+// Auto-learn: scan all scheduled data and expand each person's allowed list to include shifts they've actually been assigned.
+// This prevents "violation" false alarms for shifts the user has already intentionally scheduled.
+for(const monthKey of Object.keys(state.months || {})){
+  const md = state.months[monthKey] || {};
+  for(const [pid, shiftsMap] of Object.entries(md)){
+    const staff = state.staff.find(x => x.id === pid);
+    if(!staff || !staff.allowed) continue;
+    for(const code of Object.values(shiftsMap || {})){
+      if(code && SHIFTS[code] && !staff.allowed.includes(code)){
+        staff.allowed.push(code);
+      }
+    }
+  }
+}
+// New persistence: full shift dict + order (from add/edit/delete).
+if(state.shifts && typeof state.shifts === "object"){
+  SHIFTS = state.shifts;
+}
+if(Array.isArray(state.shiftOrder) && state.shiftOrder.length){
+  SHIFT_ORDER = state.shiftOrder.filter(c => SHIFTS[c]);
+}
+// Back-compat: old shiftOverride only patches label/time/hours/desc
+if(state.shiftOverride){
+  for(const [code, ov] of Object.entries(state.shiftOverride)){
+    if(SHIFTS[code]) Object.assign(SHIFTS[code], ov);
+  }
+}
+// Ensure every shift entry has bg/fg (older data may miss these)
+for(const code of SHIFT_ORDER){
+  const s = SHIFTS[code];
+  if(!s) continue;
+  if(!s.bg) s.bg = (DEFAULT_SHIFTS_SNAPSHOT[code]?.bg) || "#e5e4e0";
+  if(!s.fg) s.fg = (DEFAULT_SHIFTS_SNAPSHOT[code]?.fg) || "#78766e";
+}
+
+// Undo stack
+function pushUndo(){
+  undoStack.push(JSON.stringify(state));
+  if(undoStack.length > UNDO_LIMIT) undoStack.shift();
+  const btn = document.getElementById("undoBtn");
+  if(btn) btn.classList.toggle("disabled", false);
+}
+function undo(){
+  if(!undoStack.length){ toast("没有可撤销的操作"); return; }
+  const prev = undoStack.pop();
+  state = JSON.parse(prev);
+  if(state.shifts && typeof state.shifts === "object") SHIFTS = state.shifts;
+  if(Array.isArray(state.shiftOrder) && state.shiftOrder.length) SHIFT_ORDER = state.shiftOrder.filter(c => SHIFTS[c]);
+  saveState();
+  render();
+  toast("已撤销");
+  const btn = document.getElementById("undoBtn");
+  if(btn) btn.classList.toggle("disabled", !undoStack.length);
+}
+
+// current month cursor
+const now = new Date();
+let cursor = { y: now.getFullYear(), m: now.getMonth() }; // m: 0-11
+if(!state.viewMode) state.viewMode = "single"; // "single" | "triple"
+function getMonthList(){
+  const list = [];
+  if(state.viewMode === "triple"){
+    // previous, current, next — cursor is the middle
+    const prev = new Date(cursor.y, cursor.m - 1, 1);
+    const next = new Date(cursor.y, cursor.m + 1, 1);
+    list.push({y: prev.getFullYear(), m: prev.getMonth()});
+    list.push({y: cursor.y, m: cursor.m});
+    list.push({y: next.getFullYear(), m: next.getMonth()});
+  } else {
+    list.push({y: cursor.y, m: cursor.m});
+  }
+  return list;
+}
+function ymKey(y,m){ return `${y}-${String(m+1).padStart(2,"0")}`; }
+function ensureMonth(y,m){
+  const key = ymKey(y,m);
+  if(!state.months[key]) state.months[key] = {}; // {personId: {day: shiftCode}}
+  return state.months[key];
+}
+function daysInMonth(y,m){ return new Date(y, m+1, 0).getDate(); }
+function fmtDate(y,m,d){ return `${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`; }
+function weekdayZh(w){ return ["周日","周一","周二","周三","周四","周五","周六"][w]; }
+
+/* =========================================================
+   Selection state
+   ========================================================= */
+let selection = new Set(); // "personId|day"
+let dragging = false, dragAdd = true;
+let mouseDownCell = null;
+
+/* =========================================================
+   Render grid
+   ========================================================= */
+const gridEl = document.getElementById("grid");
+const monthLabelEl = document.getElementById("monthLabel");
+const kpiRowEl = document.getElementById("kpiRow");
+const legendEl = document.getElementById("legend");
+const statsTableEl = null; // removed; content merged into audit panel
+const auditPanelEl = document.getElementById("auditPanel");
+const dailyCoverageEl = document.getElementById("dailyCoverage");
+const teamOverviewEl = document.getElementById("teamOverview");
+const pickerEl = document.getElementById("picker");
+
+function render(){
+  const monthList = getMonthList();
+  const {y,m} = cursor;
+  monthLabelEl.textContent = state.viewMode === "triple"
+    ? `${monthList[0].y}/${monthList[0].m+1} · ${monthList[1].y}/${monthList[1].m+1} · ${monthList[2].y}/${monthList[2].m+1}`
+    : `${y} 年 ${m+1} 月`;
+  const daysTotal = monthList.reduce((s, mo) => s + daysInMonth(mo.y, mo.m), 0);
+  gridEl.style.setProperty("--days", daysTotal);
+  gridEl.innerHTML = "";
+  gridEl.classList.add("hoverable");
+  gridEl.classList.toggle("multi-month", state.viewMode === "triple");
+  // Update view mode button label
+  const vb = document.getElementById("viewModeBtn");
+  if(vb) vb.textContent = state.viewMode === "triple" ? "单月" : "3 月";
+
+  const today = new Date();
+
+  // ===== Header row =====
+  const hName = el("div", "g-h name-h", "人员");
+  gridEl.appendChild(hName);
+  for(let mi=0; mi<monthList.length; mi++){
+    const mo = monthList[mi];
+    const days = daysInMonth(mo.y, mo.m);
+    const isThisMonth = today.getFullYear() === mo.y && today.getMonth() === mo.m;
+    const isCursorMonth = mo.y === cursor.y && mo.m === cursor.m;
+    for(let d=1; d<=days; d++){
+      const dt = new Date(mo.y, mo.m, d);
+      const w = dt.getDay();
+      const dateStr = fmtDate(mo.y, mo.m, d);
+      const dh = el("div", "g-h day-h");
+      if(isRestDay(dateStr, dt)) dh.classList.add("weekend");
+      if(isThisMonth && d === today.getDate()) dh.classList.add("today");
+      const monthStart = d === 1 && (state.viewMode === "triple" || mi > 0);
+      if(monthStart) dh.classList.add("month-start");
+      const monthTag = monthStart ? `<span class="month-tag">${mo.m+1}月</span>` : "";
+      dh.innerHTML = `${monthTag}<div class="dnum">${d}</div><div class="dwk">${weekdayZh(w)}</div>`;
+      if(isHoliday(dateStr)) dh.title = "公众假期";
+      dh.dataset.date = dateStr;
+      dh.dataset.day = d;
+      dh.dataset.ymkey = ymKey(mo.y, mo.m);
+      // Faded for non-cursor months
+      if(!isCursorMonth) dh.style.opacity = "0.7";
+      gridEl.appendChild(dh);
+    }
+  }
+  // Right-side stat cols only in single-month mode (multi-month drops them for horizontal space)
+  const showStatCols = state.viewMode === "single";
+  if(showStatCols){
+    gridEl.appendChild(el("div","g-h stat-h","日"));
+    gridEl.appendChild(el("div","g-h stat-h last-col","节奏 / 工时"));
+  }
+
+  // ===== Person rows =====
+  // Ensure month data for every month in the list
+  for(const mo of monthList) ensureMonth(mo.y, mo.m);
+  let rowIdx = 0;
+  let lastGroup = null;
+  for(const p of state.staff){
+    const rowCls = (rowIdx % 2 === 1) ? "row-odd" : "row-even";
+    const isGroupStart = lastGroup !== null && lastGroup !== p.group;
+    const groupCls = isGroupStart ? " group-start" : "";
+    // name cell
+    const nc = el("div", `g-name group-${p.group} ${rowCls}${p.exempt ? ' dim' : ''}${groupCls}`);
+    nc.dataset.pid = p.id;
+    const fixedBadge = p.fixed ? ` <span class="row-violation-badge" style="background:#eef2ff;color:#0e6ea8;">固定 ${escapeHtml(SHIFTS[p.fixed]?.label || p.fixed)}</span>` : "";
+    const exemptBadge = p.exempt ? ' <span class="row-violation-badge" style="background:#e5e4e0;color:#78766e;" title="不参与排班（未入职/离职/暂停）">不排班</span>' : "";
+    let dateBadge = "";
+    if(p.startDate || p.endDate){
+      const s = p.startDate ? p.startDate.slice(5).replace("-","/") : "";
+      const e = p.endDate   ? p.endDate.slice(5).replace("-","/") : "";
+      const range = p.startDate && p.endDate ? `${s} → ${e}` : (p.startDate ? `${s} 起` : `${e} 止`);
+      dateBadge = ` <span class="row-violation-badge" style="background:#fff7ed;color:#a25a00;" title="入职/离职范围">${escapeHtml(range)}</span>`;
+    }
+    nc.innerHTML = `
+      <div class="n-title" title="点击编辑"><span class="group-dot"></span>${escapeHtml(p.name)}${fixedBadge}${exemptBadge}${dateBadge}</div>
+      <div class="n-meta">${escapeHtml(p.role||"")}${p.note ? " · " + escapeHtml(p.note) : ""}</div>`;
+    nc.querySelector(".n-title").addEventListener("click", () => openStaff(p.id));
+    gridEl.appendChild(nc);
+
+    let onDutyDays = 0;
+    let monthHours = 0;
+    let overtime = 0;
+    let toilUsed = 0;
+    const rhythm = [];
+
+    for(let mi=0; mi<monthList.length; mi++){
+      const mo = monthList[mi];
+      const days2 = daysInMonth(mo.y, mo.m);
+      const monthData = state.months[ymKey(mo.y, mo.m)] || {};
+      const isThisMonth2 = today.getFullYear() === mo.y && today.getMonth() === mo.m;
+      const isCursorMonth = mo.y === cursor.y && mo.m === cursor.m;
+      for(let d=1; d<=days2; d++){
+        const dt = new Date(mo.y, mo.m, d);
+        const dateStr = fmtDate(mo.y, mo.m, d);
+        const rest = isRestDay(dateStr, dt);
+        const key = `${p.id}|${dateStr}`;
+        const shift = (monthData[p.id] || {})[d] || "";
+        const monthStart = d === 1 && (state.viewMode === "triple" || mi > 0);
+        const c = el("div", `cell ${rowCls}${isGroupStart ? ' group-start' : ''}${monthStart ? ' month-start' : ''}`);
+        c.dataset.pid = p.id;
+        c.dataset.day = d;
+        c.dataset.date = dateStr;
+        c.dataset.ymkey = ymKey(mo.y, mo.m);
+        if(rest) c.classList.add("weekend");
+        if(isThisMonth2 && d === today.getDate()) c.classList.add("today");
+        if(selection.has(key)) c.classList.add("selected");
+        if(!isCursorMonth && state.viewMode === "triple") c.classList.add("adjacent-month");
+
+        const active = isPersonActive(p, dateStr);
+        if(!active){
+          c.classList.add("exempt");
+          const reason = inactiveReason(p, dateStr);
+          c.innerHTML = `<span class="pill XX" title="${escapeHtml(reason)}">—</span>`;
+          rhythm.push("XX");
+        } else if(shift && SHIFTS[shift]){
+          const allowed = new Set(p.allowed);
+          if(!allowed.has(shift)){
+            c.classList.add("violation");
+            c.title = `${p.name} 通常不排「${SHIFTS[shift].label}」班`;
+          }
+          if(shift === "NA") c.classList.add("na");
+          const s = SHIFTS[shift];
+          c.innerHTML = `<span class="pill" style="background:${s.bg};color:${s.fg};" title="${escapeHtml(s.desc||'')}">${escapeHtml(s.label)}</span>`;
+          rhythm.push(shift);
+        } else {
+          c.innerHTML = "";
+          rhythm.push("");
+        }
+
+        // Only accumulate stats for the cursor month (right-side "日" and rhythm still reflect cursor month)
+        if(isCursorMonth){
+          if(ON_DUTY.has(shift)){
+            onDutyDays++;
+            monthHours += SHIFTS[shift].hours;
+            if(SHIFTS[shift].hours > 9) overtime += (SHIFTS[shift].hours - 9);
+          }
+          if(shift === "TO") toilUsed++;
+        }
+        gridEl.appendChild(c);
+      }
+    }
+
+    // "日" and rhythm columns only rendered in single-month mode
+    if(state.viewMode !== "single"){ rowIdx++; lastGroup = p.group; continue; }
+    // 上班日数
+    const dc = el("div", `g-daycount ${rowCls}${isGroupStart ? ' group-start' : ''}`, p.exempt ? "—" : String(onDutyDays));
+    dc.dataset.pid = p.id;
+    gridEl.appendChild(dc);
+
+    // Rhythm bar + hours
+    const rb = el("div", `rhythm last-col ${rowCls}${isGroupStart ? ' group-start' : ''}`);
+    rb.dataset.pid = p.id;
+    const dots = document.createElement("div");
+    dots.className = "rhythm-dots";
+    for(const code of rhythm){
+      const s = document.createElement("span");
+      if(code === "XX") s.style.background = "#d6d5cf";
+      else if(code && SHIFTS[code]) s.style.background = SHIFTS[code].bg;
+      dots.appendChild(s);
+    }
+    rb.appendChild(dots);
+    const rn = document.createElement("div");
+    rn.className = "rhythm-num";
+    if(p.exempt) rn.textContent = "—";
+    else {
+      const toilEarned = overtime / 9;
+      const toilBalance = toilEarned - toilUsed;
+      let toilStr = "";
+      if(toilEarned || toilUsed){
+        const color = toilBalance > 0.005 ? "var(--ok)" : (toilBalance < -0.005 ? "var(--danger)" : "var(--muted)");
+        const sign = toilBalance > 0 ? "+" : "";
+        toilStr = ` <span style="color:${color};" title="挣 ${fmtDay(toilEarned)||0} 天 · 已用 ${toilUsed} 天">↺${sign}${fmtDay(toilBalance)||0}d</span>`;
+      }
+      rn.innerHTML = `${monthHours}h${overtime? ` <span style="color:var(--warn);" title="周末/假日超时累计">+${overtime}</span>` : ""}${toilStr}`;
+    }
+    rb.appendChild(rn);
+    gridEl.appendChild(rb);
+    rowIdx++;
+    lastGroup = p.group;
+  }
+
+  // "+ Add person" row (spans full width)
+  const addRow = el("div", "g-name-add");
+  addRow.innerHTML = `<span class="kbdish">+</span>添加人员（备用行 / 新加同事）`;
+  addRow.addEventListener("click", () => {
+    const newP = { id: "n"+Date.now(), name: "新成员", role: "客服", group: "FLEX", allowed: SHIFT_ORDER, note: "" };
+    state.staff.push(newP);
+    saveState();
+    render();
+    // Open editor focused on this new person so they can rename immediately
+    openStaff(newP.id);
+  });
+  gridEl.appendChild(addRow);
+
+  renderKPI(y,m);
+  renderLegend();
+  renderRuleChecks(y,m);
+  renderDailyCoverage(y,m);
+  renderTeamOverview();
+  saveState();
+}
+
+function el(tag, cls, text){
+  const e = document.createElement(tag);
+  if(cls) e.className = cls;
+  if(text !== undefined) e.textContent = text;
+  return e;
+}
+function escapeHtml(s){ return String(s ?? "").replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m])); }
+
+/* =========================================================
+   KPI / legend / stats / rules
+   ========================================================= */
+function computePersonStats(p, y, m){
+  const days = daysInMonth(y,m);
+  const monthData = state.months[ymKey(y,m)] || {};
+  const shifts = monthData[p.id] || {};
+  const s = { onDuty:0, hours:0, overtime:0, toilEarned:0, toilUsed:0, al:0, hal:0, lv:0, off:0, sb:0, na:0, restCredit:0, activeDays:0, alDays:0, weekendShifts:0 };
+  for(let d=1; d<=days; d++){
+    const dateStr = fmtDate(y,m,d);
+    if(!isPersonActive(p, dateStr)) continue;
+    s.activeDays++;
+    const code = shifts[d];
+    // Empty cell no longer counts as rest — user must explicitly mark 休/SB/离/补/停
+    if(!code) continue;
+    if(ON_DUTY.has(code)){
+      s.onDuty++;
+      s.hours += SHIFTS[code].hours;
+      if(SHIFTS[code].hours > 9) s.overtime += (SHIFTS[code].hours - 9);
+      const dt = new Date(y,m,d);
+      if(isRestDay(dateStr, dt)) s.weekendShifts++;
+    }
+    // AL family: independent annual leave, doesn't affect weekly rest quota
+    if(code === "AL"){ s.al += 1; s.alDays += 1; }
+    if(code === "HAM"){ s.al += 0.5; s.alDays += 0.5; s.hal += 0.5; }
+    if(code === "HAP"){ s.al += 0.5; s.alDays += 0.5; s.hal += 0.5; }
+    if(code === "HAL"){ s.al += 0.5; s.alDays += 0.5; s.hal += 0.5; }
+    if(code === "LV") s.lv++;
+    if(code === "OFF") s.off++;
+    if(code === "SB") s.sb++;
+    if(code === "NA") s.na++;
+    if(code === "TO") s.toilUsed++;
+    // restCredit 不在这里累加，由 computePersonAudit 用 wkStart 归属规则统一算
+  }
+  // Toil accrual is fractional: 3h weekend overtime = 3/9 = 0.33 day
+  s.toilEarned = s.overtime / 9;
+  s.toilBalance = s.toilEarned - s.toilUsed;
+  return s;
+}
+// Format a fractional day value (rounds to 2 decimals; integers show without ".00")
+function fmtDay(v){
+  if(v === 0 || v === undefined || v === null) return "";
+  const r = Math.round(v * 100) / 100;
+  return Number.isInteger(r) ? String(r) : r.toFixed(2);
+}
+// Rolling toil accrual across ALL stored months (past, current, future).
+// This reflects a live global balance so every TO you place — regardless of month — updates the number.
+function computeRollingToil(p){
+  let earned = 0, used = 0;
+  for(const key of Object.keys(state.months)){
+    const parts = key.split("-").map(Number);
+    if(parts.length < 2) continue;
+    const y = parts[0], mm = parts[1];
+    const s = computePersonStats(p, y, mm - 1);
+    earned += s.toilEarned;
+    used   += s.toilUsed;
+  }
+  return { earned, used, balance: earned - used };
+}
+
+function renderKPI(y,m){
+  let totalOn=0, totalHours=0, totalOT=0, totalAL=0;
+  for(const p of state.staff){
+    if(p.exempt) continue;
+    const s = computePersonStats(p,y,m);
+    totalOn += s.onDuty;
+    totalHours += s.hours;
+    totalOT += s.overtime;
+    totalAL += s.al;
+  }
+  kpiRowEl.innerHTML = `
+    <div class="kpi"><div class="k-num">${totalOn}</div><div class="k-label">团队上班总日数</div></div>
+    <div class="kpi"><div class="k-num">${totalHours}</div><div class="k-label">团队总工时</div></div>
+    <div class="kpi"><div class="k-num">${totalOT}</div><div class="k-label">周末超时累计</div></div>
+    <div class="kpi"><div class="k-num">${totalAL}</div><div class="k-label">AL 天数</div></div>
+  `;
+}
+
+function renderLegend(){
+  legendEl.innerHTML = SHIFT_ORDER.map(code => {
+    const s = SHIFTS[code];
+    return `<div class="legend-item"><span class="pill" style="background:${s.bg};color:${s.fg};">${escapeHtml(s.label)}</span>${escapeHtml(s.time||"")}</div>`;
+  }).join("");
+}
+// Shortcut: render a shift pill via inline style
+function shiftPill(code, extraStyle){
+  const s = SHIFTS[code];
+  if(!s) return `<span class="pill">${escapeHtml(code)}</span>`;
+  return `<span class="pill" style="background:${s.bg};color:${s.fg};${extraStyle||''}">${escapeHtml(s.label)}</span>`;
+}
+
+function renderStatsTable(y,m){
+  const rows = state.staff.filter(p => !p.exempt).map(p => {
+    const s = computePersonStats(p,y,m);
+    const roll = computeRollingToil(p);
+    // Current month cell: +earned -used = balance
+    let toilCell = "";
+    if(s.toilEarned || s.toilUsed){
+      const eStr = fmtDay(s.toilEarned) || "0";
+      const uStr = s.toilUsed ? `-${s.toilUsed}` : "";
+      const bStr = fmtDay(s.toilBalance) || "0";
+      const bCls = s.toilBalance>0.005?'good':(s.toilBalance<-0.005?'err':'');
+      toilCell = `<span style="color:var(--ok);">+${eStr}</span>${uStr?` <span style="color:var(--danger);">${uStr}</span>`:""} <span style="color:var(--muted);">=</span> <span class="${bCls==='err'?'err':bCls==='good'?'good':''}" style="font-weight:500;">${bStr}</span>`;
+    }
+    // Rolling cell: just the balance number, colored by sign
+    let rollCell = "";
+    if(roll.earned || roll.used){
+      const rStr = fmtDay(roll.balance) || "0";
+      const cls = roll.balance>0.005?'good':(roll.balance<-0.005?'err':'');
+      rollCell = `<span class="${cls}" style="font-weight:600;">${rStr}</span>`;
+    }
+    return `<tr>
+      <td class="sticky-col">${escapeHtml(p.name)}</td>
+      <td>${s.onDuty}</td>
+      <td>${s.hours}</td>
+      <td class="${s.overtime>0?'warn':''}">${s.overtime||''}</td>
+      <td style="text-align:right;font-size:11px;white-space:nowrap;" title="本月：超时 ${s.overtime}h ÷ 9 = 挣 ${fmtDay(s.toilEarned)||0} 天；已用 ${s.toilUsed||0} 天；结余 ${fmtDay(s.toilBalance)||0}">${toilCell}</td>
+      <td style="text-align:right;" title="全局（所有月份合计）：累计挣 ${fmtDay(roll.earned)||0} · 累计用 ${roll.used||0} · 结余 ${fmtDay(roll.balance)||0}">${rollCell}</td>
+      <td>${fmtDay(s.al)||''}</td>
+    </tr>`;
+  }).join("");
+  statsTableEl.innerHTML = `
+    <thead><tr>
+      <th class="sticky-col">成员</th>
+      <th>上班</th>
+      <th>工时</th>
+      <th>超时</th>
+      <th style="text-align:right;">本月 挣/用/余</th>
+      <th style="text-align:right;" title="全局所有月份合计的补休结余（会实时反映任何月份的排班）">全局</th>
+      <th>AL</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  `;
+}
+
+// Helper: Mon-Sun week bounds for a given date
+function weekBoundsMonSun(dt){
+  const dow = dt.getDay(); // 0=Sun ... 6=Sat
+  const offsetToMonday = dow === 0 ? -6 : 1 - dow;
+  const wkStart = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate() + offsetToMonday);
+  const wkEnd   = new Date(wkStart.getFullYear(), wkStart.getMonth(), wkStart.getDate() + 6);
+  return { wkStart, wkEnd };
+}
+// ======= Audit computations =======
+// 权威 restCredit + expectedRest 用 wkStart 归属规则：
+//   - 一周（Mon-Sun）归 wkStart 所在的月
+//   - 跨月周会读到下月的数据（如 8/31-9/6 归 8 月，需读 9 月 monthData）
+//   - 应休（周末+假期计数）只在**完整周**（wkStart 和 wkEnd 都在本月）内计算
+//   - 实休（restCredit）在**所有 wkStart 归属本月的周**内计算，包括跨月周的下月部分
+function computePersonAudit(p, y, m){
+  const s = computePersonStats(p, y, m);
+  // 若该员工在该月完全无排班数据 → 视为该月未参与，audit 返回 0（避免空月份产生虚假欠账）
+  const monthData = state.months[ymKey(y,m)] || {};
+  const personShifts = monthData[p.id];
+  if(!personShifts || Object.keys(personShifts).length === 0){
+    return { ...s, restCredit: 0, expectedRest: 0, restDeficit: 0 };
+  }
+  const daysInThisMonth = daysInMonth(y, m);
+  const seenWeeks = new Set();
+  let expectedRest = 0;
+  let restCredit = 0;
+  for(let d=1; d<=daysInThisMonth; d++){
+    const dt = new Date(y, m, d);
+    const { wkStart, wkEnd } = weekBoundsMonSun(dt);
+    // 只处理 wkStart 归属本月的周
+    if(wkStart.getMonth() !== m || wkStart.getFullYear() !== y) continue;
+    const wkKey = wkStart.getTime();
+    if(seenWeeks.has(wkKey)) continue;
+    seenWeeks.add(wkKey);
+    const fullyInMonth = wkEnd.getMonth() === m && wkEnd.getFullYear() === y;
+    // 遍历该周 7 天（可能跨到下月）
+    for(let i=0; i<7; i++){
+      const wd = new Date(wkStart.getFullYear(), wkStart.getMonth(), wkStart.getDate() + i);
+      const wy = wd.getFullYear(), wmm = wd.getMonth(), wDay = wd.getDate();
+      const dateStr = fmtDate(wy, wmm, wDay);
+      if(!isPersonActive(p, dateStr)) continue;
+      // Rest credit: 读该天的 shift（可能在下月 monthData）
+      const md = state.months[ymKey(wy, wmm)] || {};
+      const code = (md[p.id] || {})[wDay];
+      if(code && REST_CREDIT[code] !== undefined) restCredit += REST_CREDIT[code];
+      // Expected rest: 只在完整周内数周末/假期
+      if(fullyInMonth && isRestDay(dateStr, wd)) expectedRest++;
+    }
+  }
+  const restDeficit = expectedRest - restCredit; // >0 = 漏排周休
+  return { ...s, restCredit, expectedRest, restDeficit };
+}
+// Cross-month rolling rest balance — 少排了一天休可以在别的月份补回来
+function computeRollingRest(p){
+  let expected = 0, actual = 0;
+  for(const key of Object.keys(state.months)){
+    const parts = key.split("-").map(Number);
+    if(parts.length < 2) continue;
+    const y = parts[0], mm = parts[1];
+    const a = computePersonAudit(p, y, mm - 1);
+    expected += a.expectedRest;
+    actual   += a.restCredit;
+  }
+  return { expected, actual, balance: actual - expected }; // 正 = 富余 · 负 = 欠假
+}
+
+// ======= Audit table (per-person compliance) =======
+function renderRuleChecks(y,m){
+  // Build audit rows
+  const rows = state.staff.filter(p => !p.exempt).map(p => {
+    const a = computePersonAudit(p, y, m);
+    const roll = computeRollingRest(p);
+    const restCls = a.restDeficit > 0.5 ? 'err' : (a.restDeficit > 0 ? 'warn' : 'good');
+    const rollCls = roll.balance < -0.5 ? 'err' : (roll.balance < 0 ? 'warn' : 'good');
+    const allowedSet = new Set(p.allowed);
+    const monthData = state.months[ymKey(y,m)] || {};
+    const shifts = monthData[p.id] || {};
+    let violationCount = 0;
+    for(let d=1; d<=daysInMonth(y,m); d++){
+      const code = shifts[d];
+      if(code && !allowedSet.has(code)) violationCount++;
+    }
+    return { p, a, roll, restCls, rollCls, violationCount };
+  });
+  const fmtDiff = v => {
+    const r = Math.round(v);
+    if(r > 0) return "+" + r;
+    if(r < 0) return String(r);
+    return "0";
+  };
+  // Also compute rolling toil (compensatory hours) for each person
+  const rollingToilByPid = {};
+  for(const {p} of rows) rollingToilByPid[p.id] = computeRollingToil(p);
+  const html = `
+    <div style="max-height: 360px; overflow: auto;">
+      <table class="stats-table audit-table">
+        <thead><tr>
+          <th class="sticky-col">成员</th>
+          <th title="本月活跃天数（在职天）">活跃</th>
+          <th title="本月排了工作班的天数（含 AD/E/N/M/L/WE/WL）">上班</th>
+          <th title="本月总工时（9h 工作日 + 12h 周末/假日）">工时</th>
+          <th title="本月周末/假日 12h 班超出 9h 的部分累计">超时</th>
+          <th title="AL 全天 + HAL 各 0.5">AL</th>
+          <th title="周休（休 LV）标记的天数">周休</th>
+          <th title="应休 = 完整周内的休息日（周末 + 公众假期），跨月周按 wkStart 归属月">应休</th>
+          <th title="实休 = 归属本月的完整周内的 LV/SB/OFF/TO/NA 标记">实休</th>
+          <th title="本月：实休 − 应休。负 = 漏排；正 = 多排">本月差</th>
+          <th title="所有月份累计：实休 − 应休">累计</th>
+          <th title="本月补休：挣（超时÷9）− 用（TO 数）">本月补</th>
+          <th title="全局补休累计（所有月合计）">补余</th>
+          <th title="排了不在 allowed 列表内的班次数">违规</th>
+        </tr></thead>
+        <tbody>
+        ${rows.map(({p, a, roll, restCls, rollCls, violationCount}) => {
+          const rt = rollingToilByPid[p.id];
+          const toilRollCls = rt.balance > 0.005 ? 'good' : (rt.balance < -0.005 ? 'err' : '');
+          const toilBalStr = rt.balance !== 0 ? (rt.balance > 0 ? '+' : '') + fmtDay(rt.balance) : '';
+          const monthToilStr = (a.toilEarned || a.toilUsed) ? `+${fmtDay(a.toilEarned)||0}${a.toilUsed?` −${a.toilUsed}`:''}` : '';
+          return `<tr>
+            <td class="sticky-col" style="cursor:pointer;" onclick="openStaff('${p.id}')" title="点击编辑">${escapeHtml(p.name)}</td>
+            <td>${a.activeDays}</td>
+            <td>${a.onDuty}</td>
+            <td>${a.hours || ""}</td>
+            <td class="${a.overtime>0?'warn':''}">${a.overtime || ""}</td>
+            <td>${fmtDay(a.al) || ""}</td>
+            <td>${a.lv || ""}</td>
+            <td>${a.expectedRest || ""}</td>
+            <td>${Math.round(a.restCredit) || ""}</td>
+            <td class="${restCls}" title="${a.restDeficit > 0 ? '本月漏排周休 ' + Math.round(a.restDeficit) + ' 天' : (a.restDeficit < 0 ? '本月多排周休 ' + Math.round(-a.restDeficit) + ' 天' : '本月周休满足')}">${fmtDiff(-a.restDeficit)}</td>
+            <td class="${rollCls}" title="全局累计：应休 ${Math.round(roll.expected)} · 实休 ${Math.round(roll.actual)} · 差 ${Math.round(roll.balance)}">${fmtDiff(roll.balance)}</td>
+            <td style="font-size:11px;white-space:nowrap;" title="超时 ${a.overtime}h ÷ 9 = 挣 ${fmtDay(a.toilEarned)||0} 天 · 已用 ${a.toilUsed||0} 天">${monthToilStr}</td>
+            <td class="${toilRollCls}" title="全局补休：挣 ${fmtDay(rt.earned)} · 用 ${rt.used} · 余 ${fmtDay(rt.balance)}">${toilBalStr}</td>
+            <td class="${violationCount > 0 ? 'err' : ''}">${violationCount || ""}</td>
+          </tr>`;
+        }).join("")}
+        </tbody>
+      </table>
+    </div>
+    <div style="padding: 8px 12px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); line-height:1.6;">
+      规则 <b>上 5 休 2</b>：每周应有 2 天周休。<br>
+      <b>归属规则</b>：一周（Mon–Sun）归 <u>wkStart 所在月</u>。<br>
+      · 8/1-2 属 7/27 起的周 → 归 7 月（不计 8 月）。<br>
+      · 8/31 属 8/31 起的周 → 归 8 月（含 9/5-6 的休息日）。<br>
+      <b>应休 · 只在完整周内</b>：wkStart 和 wkEnd 都在本月的周才计入应休（周末 + 公众假期）。<br>
+      <b>实休 · wkStart 归属</b>：<span class="pill" style="background:#ddd6fe;color:#4c1d95;padding:0 4px;border-radius:3px;">休</span>
+      <span class="pill" style="background:#fef9c3;color:#713f12;padding:0 4px;border-radius:3px;">SB</span>
+      <span class="pill" style="background:#fed7aa;color:#7c2d12;padding:0 4px;border-radius:3px;">離</span>
+      <span class="pill" style="background:#bbf7d0;color:#14532d;padding:0 4px;border-radius:3px;">补</span>
+      <span class="pill" style="background:#e5e4e0;color:#78766e;padding:0 4px;border-radius:3px;">停</span>
+      各 1 天，按 wkStart 归属月计入（跨月周会读下月数据）。<u>空档不算</u>。<br>
+      <b>AL / ½AL</b>：独立年假福利，不影响应休/实休。<br>
+      <b>SB</b>：备班（不算工作、算休息）。<br>
+      <b>补(TO)</b>：员工额外上了周末班后的补假。<br>
+      「累计」= 所有月份合计余：<span class="good">正</span> = 富余可留下月抵 · <span class="err">负</span> = 欠假需补。
+    </div>
+  `;
+  auditPanelEl.innerHTML = html;
+}
+
+// ======= Daily coverage (early / mid / late) =======
+function renderDailyCoverage(y,m){
+  const days = daysInMonth(y,m);
+  const monthData = state.months[ymKey(y,m)] || {};
+  const rows = [];
+  for(let d=1; d<=days; d++){
+    const dt = new Date(y,m,d);
+    const dateStr = fmtDate(y,m,d);
+    const rest = isRestDay(dateStr, dt);
+    let early = 0, mid = 0, late = 0, total = 0;
+    for(const p of state.staff){
+      if(!isPersonActive(p, dateStr)) continue;
+      const code = (monthData[p.id] || {})[d];
+      if(!ON_DUTY.has(code)) continue;
+      total++;
+      // 早班桶 = E + WE (12h 早涵盖 early + mid)
+      // 中班桶 = M + WE + WL
+      // 晚班桶 = L + WL (12h 晚涵盖 mid + late)
+      // N / AD 都不计入任何桶（正常班与全天候值守不代表任何一个时段的班）
+      if(code === "E") early++;
+      if(code === "WE"){ early++; mid++; }
+      if(code === "M") mid++;
+      if(code === "WL"){ mid++; late++; }
+      if(code === "L") late++;
+    }
+    rows.push({d, dt, dateStr, rest, early, mid, late, total});
+  }
+  // 0 = 红；>=1 = 普通黑数字
+  const cellStyle = v => v === 0 ? 'style="color:var(--danger);font-weight:600;"' : 'style="color:var(--text);"';
+  const missingLabel = r => {
+    const gaps = [];
+    if(r.early === 0) gaps.push("早");
+    if(r.mid === 0)   gaps.push("中");
+    if(r.late === 0)  gaps.push("晚");
+    return gaps.length ? `<span class="err" style="font-weight:600;">缺 ${gaps.join(" · ")}</span>` : `<span style="color:var(--ok);">✓</span>`;
+  };
+  const html = `
+    <table class="stats-table" style="width:100%;">
+      <thead><tr>
+        <th class="sticky-col">日</th>
+        <th>早</th>
+        <th>中</th>
+        <th>晚</th>
+        <th style="text-align:left;">缺班</th>
+      </tr></thead>
+      <tbody>
+      ${rows.map(r => `
+        <tr>
+          <td class="sticky-col" style="${r.rest?'color:var(--danger);':''}">${r.d} ${weekdayZh(r.dt.getDay())}</td>
+          <td ${cellStyle(r.early)} title="早班 (E · WE)">${r.early}</td>
+          <td ${cellStyle(r.mid)} title="中班 (M · WE · WL)">${r.mid}</td>
+          <td ${cellStyle(r.late)} title="晚班 (L · WL)">${r.late}</td>
+          <td style="text-align:left;">${missingLabel(r)}</td>
+        </tr>
+      `).join("")}
+      </tbody>
+    </table>
+    <div style="padding: 8px 12px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); line-height:1.55;">
+      规则：每天必须有<b>早 · 中 · 晚</b>三种班覆盖。<br>
+      · <b>早</b>桶 = E · WE（12h 早也覆盖早）<br>
+      · <b>中</b>桶 = M · WE · WL（12h 早/晚都覆盖中）<br>
+      · <b>晚</b>桶 = L · WL（12h 晚也覆盖晚）<br>
+      · N 正常班 和 AD 全天候 <u>不计入</u>任何桶。<br>
+      数字为该桶实际排班人数。<span class="err">红 0</span> = 缺班（右列会列出）。
+    </div>
+  `;
+  dailyCoverageEl.innerHTML = html;
+}
+
+// ======= Team overview (show hire/leave dates + status) =======
+function renderTeamOverview(){
+  const html = `
+    <table class="stats-table" style="width:100%;">
+      <thead><tr>
+        <th class="sticky-col">成员</th>
+        <th style="text-align:left;">角色</th>
+        <th>入职</th>
+        <th>离职</th>
+        <th>状态</th>
+        <th></th>
+      </tr></thead>
+      <tbody>
+      ${state.staff.map(p => {
+        const monthStart = fmtDate(cursor.y, cursor.m, 1);
+        const monthEnd   = fmtDate(cursor.y, cursor.m, daysInMonth(cursor.y, cursor.m));
+        // 只有 startDate 完全晚于本月末（整月都还没入职）或 endDate 早于本月初（整月都已离职）才标记
+        // 月中入职/离职的员工在本月都算「在职」
+        const status = p.exempt ? '<span class="err">停用</span>' :
+          (p.endDate && p.endDate < monthStart ? '<span class="warn">已离职</span>' :
+          (p.startDate && p.startDate > monthEnd ? '<span class="warn">未入职</span>' :
+          '<span class="good">在职</span>'));
+        return `<tr>
+          <td class="sticky-col" style="cursor:pointer;" onclick="openStaff('${p.id}')" title="点击编辑人员">${escapeHtml(p.name)}</td>
+          <td style="text-align:left;color:var(--muted);">${escapeHtml(p.role||"")}</td>
+          <td style="font-variant-numeric:tabular-nums;">${escapeHtml(p.startDate||"—")}</td>
+          <td style="font-variant-numeric:tabular-nums;">${escapeHtml(p.endDate||"—")}</td>
+          <td>${status}</td>
+          <td><button class="link-btn" onclick="openStaff('${p.id}')" style="padding:2px 6px;">编辑</button></td>
+        </tr>`;
+      }).join("")}
+      </tbody>
+    </table>
+  `;
+  teamOverviewEl.innerHTML = html;
+}
+
+/* =========================================================
+   Cell interactions
+   ========================================================= */
+gridEl.addEventListener("mousedown", (e) => {
+  const c = e.target.closest(".cell");
+  if(!c) return;
+  const pid = c.dataset.pid;
+  const day = c.dataset.day;
+  const date = c.dataset.date;
+  const ymkey = c.dataset.ymkey;
+  const staff = state.staff.find(s => s.id === pid);
+  if(!isPersonActive(staff, date)) return;
+  const key = `${pid}|${date}`;
+  // Right-click also opens picker
+  if(e.button === 2){ e.preventDefault(); selection.clear(); updateSelectionVisual(); updateBatchBar(); openPicker(c, pid, day, ymkey); return; }
+  if(e.shiftKey){
+    const wasIn = selection.has(key);
+    if(wasIn) selection.delete(key); else selection.add(key);
+    dragging = true;
+    dragAdd = !wasIn;
+    updateSelectionVisual();
+    updateBatchBar();
+    mouseDownCell = null;
+    return;
+  }
+  mouseDownCell = { pid, day, ymkey, date, key, moved: false, cellEl: c };
+  selection.clear();
+  selection.add(key);
+  dragging = true;
+  dragAdd = true;
+  updateSelectionVisual();
+});
+gridEl.addEventListener("mousemove", (e) => {
+  if(!dragging) return;
+  const c = e.target.closest(".cell");
+  if(!c) return;
+  const staff = state.staff.find(s => s.id === c.dataset.pid);
+  const date = c.dataset.date;
+  if(!isPersonActive(staff, date)) return;
+  const key = `${c.dataset.pid}|${date}`;
+  if(mouseDownCell && key !== mouseDownCell.key) mouseDownCell.moved = true;
+  if(dragAdd) selection.add(key); else selection.delete(key);
+  updateSelectionVisual();
+});
+// Cross-hair highlight: row on pid, column on full date (cross-month safe)
+let lastHoverPid = null, lastHoverDate = null;
+gridEl.addEventListener("mouseover", (e) => {
+  const t = e.target;
+  const cell = t.closest(".cell, .g-name, .g-daycount, .rhythm, .g-h.day-h");
+  if(!cell){ clearCrosshair(); return; }
+  const pid = cell.dataset.pid || null;
+  const date = cell.dataset.date || null;
+  if(pid !== lastHoverPid || date !== lastHoverDate){
+    clearCrosshair();
+    if(pid){
+      for(const n of gridEl.querySelectorAll(`[data-pid="${pid}"]`)) n.classList.add("row-hi");
+      lastHoverPid = pid;
+    }
+    if(date){
+      for(const n of gridEl.querySelectorAll(`[data-date="${date}"]`)) n.classList.add("col-hi");
+      lastHoverDate = date;
+    }
+  }
+});
+gridEl.addEventListener("mouseleave", () => clearCrosshair());
+function clearCrosshair(){
+  if(lastHoverPid){
+    for(const n of gridEl.querySelectorAll(".row-hi")) n.classList.remove("row-hi");
+    lastHoverPid = null;
+  }
+  if(lastHoverDate){
+    for(const n of gridEl.querySelectorAll(".col-hi")) n.classList.remove("col-hi");
+    lastHoverDate = null;
+  }
+}
+
+mouseupHandler = () => {
+  if(!dragging){ mouseDownCell = null; return; }
+  dragging = false;
+  if(mouseDownCell && !mouseDownCell.moved){
+    const md = mouseDownCell;
+    selection.clear();
+    updateSelectionVisual();
+    updateBatchBar();
+    openPicker(md.cellEl, md.pid, md.day, md.ymkey);
+  } else {
+    updateBatchBar();
+  }
+  mouseDownCell = null;
+};
+document.addEventListener("mouseup", mouseupHandler);
+gridEl.addEventListener("contextmenu", (e) => e.preventDefault());
+gridEl.addEventListener("click", (e) => {
+  const c = e.target.closest(".cell");
+  if(!c && !e.target.closest(".picker")) closePicker();
+});
+
+// Cycle: click a single cell with no multi-selection
+function cycleCell(pid, day){
+  pushUndo();
+  const monthData = ensureMonth(cursor.y, cursor.m);
+  if(!monthData[pid]) monthData[pid] = {};
+  const cur = monthData[pid][day] || "";
+  const idx = CYCLE.indexOf(cur);
+  const next = CYCLE[(idx + 1) % CYCLE.length];
+  if(next) monthData[pid][day] = next; else delete monthData[pid][day];
+  render();
+}
+
+function updateSelectionVisual(){
+  for(const c of gridEl.querySelectorAll(".cell")){
+    const key = `${c.dataset.pid}|${c.dataset.date}`;
+    c.classList.toggle("selected", selection.has(key));
+  }
+}
+
+const batchbarEl = document.getElementById("batchbar");
+function updateBatchBar(){
+  if(selection.size < 2){ batchbarEl.classList.remove("open"); batchbarEl.innerHTML = ""; return; }
+  const opts = SHIFT_ORDER.map(code => `
+    <div class="bb-opt" data-code="${code}" title="${escapeHtml(SHIFTS[code].time||'')}">
+      ${shiftPill(code)}
+      <span style="color:var(--text-2);">${escapeHtml((SHIFTS[code].time||'').replace('–','-'))}</span>
+    </div>`).join("");
+  batchbarEl.innerHTML = `
+    <div class="bb-count">已选 ${selection.size} 格</div>
+    ${opts}
+    <div class="bb-sep"></div>
+    <div class="bb-opt" data-code=""><span class="pill" style="background:#eee;color:#888;">清</span><span style="color:var(--text-2);">留空</span></div>
+    <div class="bb-clear" id="bbCancel">取消 Esc</div>
+  `;
+  batchbarEl.classList.add("open");
+}
+batchbarEl.addEventListener("mousedown", (e) => e.stopPropagation());
+batchbarEl.addEventListener("click", (e) => {
+  const opt = e.target.closest(".bb-opt");
+  if(opt){
+    const code = opt.dataset.code;
+    fillSelection(code);
+    return;
+  }
+  if(e.target.id === "bbCancel"){
+    selection.clear();
+    render();
+    updateBatchBar();
+  }
+});
+
+function fillSelection(code){
+  pushUndo();
+  for(const key of selection){
+    const [pid, date] = key.split("|");
+    if(!date) continue;
+    const [y2, m2, d2] = date.split("-").map(Number);
+    const md = ensureMonth(y2, m2-1);
+    const staff = state.staff.find(s => s.id === pid);
+    if(!isPersonActive(staff, date)) continue;
+    if(!md[pid]) md[pid] = {};
+    if(code === "") delete md[pid][d2];
+    else md[pid][d2] = code;
+  }
+  render();
+  updateBatchBar();
+}
+
+// Keyboard
+keydownHandler = (e) => {
+  if(document.activeElement && ["INPUT","TEXTAREA","SELECT"].includes(document.activeElement.tagName)) return;
+  if((e.ctrlKey || e.metaKey) && e.key === "z"){ e.preventDefault(); undo(); return; }
+  if(e.key === "Escape"){ selection.clear(); render(); closePicker(); updateBatchBar(); return; }
+  if(e.key === "Delete" || e.key === "Backspace"){ if(selection.size){ fillSelection(""); e.preventDefault(); } return; }
+  const k = e.key.toLowerCase();
+  if(KEY_TO_SHIFT[k] && selection.size){
+    fillSelection(KEY_TO_SHIFT[k]);
+    e.preventDefault();
+  }
+};
+document.addEventListener("keydown", keydownHandler);
+
+/* =========================================================
+   Picker (right-click quick select)
+   ========================================================= */
+function openPicker(cellEl, pid, day, ymkey){
+  const rect = cellEl.getBoundingClientRect();
+  pickerEl.style.left = (rect.left + window.scrollX) + "px";
+  pickerEl.style.top  = (rect.bottom + window.scrollY + 4) + "px";
+  const opts = SHIFT_ORDER.map(code => `<div class="p-opt" data-code="${code}">${shiftPill(code)}<div style="font-size:10px;color:var(--muted);margin-top:2px;">${escapeHtml(SHIFTS[code].time||"")}</div></div>`).join("")
+    + `<div class="p-opt" data-code=""><div class="pill" style="background:#eee;color:#888;">清</div><div style="font-size:10px;color:var(--muted);margin-top:2px;">留空</div></div>`;
+  pickerEl.innerHTML = opts;
+  pickerEl.classList.add("open");
+  pickerEl.dataset.pid = pid;
+  pickerEl.dataset.day = day;
+  pickerEl.dataset.ymkey = ymkey || ymKey(cursor.y, cursor.m);
+}
+function closePicker(){ pickerEl.classList.remove("open"); }
+pickerEl.addEventListener("click", (e) => {
+  const opt = e.target.closest(".p-opt");
+  if(!opt) return;
+  pushUndo();
+  const code = opt.dataset.code;
+  const pid = pickerEl.dataset.pid;
+  const day = pickerEl.dataset.day;
+  const ymkey = pickerEl.dataset.ymkey;
+  const [y2, m2] = ymkey.split("-").map(Number);
+  const monthData = ensureMonth(y2, m2 - 1);
+  if(!monthData[pid]) monthData[pid] = {};
+  if(code === "") delete monthData[pid][day];
+  else monthData[pid][day] = code;
+  closePicker();
+  render();
+});
+
+/* =========================================================
+   Toolbar actions
+   ========================================================= */
+document.getElementById("prevMonth").onclick = () => { cursor.m--; if(cursor.m<0){cursor.m=11;cursor.y--;} selection.clear(); render(); };
+document.getElementById("nextMonth").onclick = () => { cursor.m++; if(cursor.m>11){cursor.m=0;cursor.y++;} selection.clear(); render(); };
+document.getElementById("todayBtn").onclick = () => { cursor.y = new Date().getFullYear(); cursor.m = new Date().getMonth(); selection.clear(); render(); };
+document.getElementById("viewModeBtn").onclick = () => {
+  state.viewMode = state.viewMode === "triple" ? "single" : "triple";
+  selection.clear();
+  saveState();
+  render();
+  toast(state.viewMode === "triple" ? "3 个月视图（当前月居中）" : "单月视图");
+};
+document.getElementById("clearMonth").onclick = () => {
+  showModal({
+    title: "⚠️ 确认清空本月排班",
+    body: `
+      <p style="margin-top:0;">将清空 <strong>${cursor.y} 年 ${cursor.m+1} 月</strong> 所有工作班次。</p>
+      <p>以下类型会<strong>保留</strong>：年假(AL)、周休(LV)、離港(OFF)、补休(TO)、停排(NA)</p>
+      <p style="color:var(--muted);font-size:12px;">可用「撤销」按钮或 Ctrl+Z 恢复</p>
+    `,
+    foot: `
+      <button class="btn" id="clearCancel">取消</button>
+      <button class="btn danger" id="clearConfirm">确认清空</button>
+    `,
+    onOpen: () => {
+      document.getElementById("clearCancel").onclick = closeModal;
+      document.getElementById("clearConfirm").onclick = () => {
+        pushUndo();
+        const monthData = ensureMonth(cursor.y, cursor.m);
+        for(const pid of Object.keys(monthData)){
+          for(const d of Object.keys(monthData[pid])){
+            const code = monthData[pid][d];
+            if(!NON_PARTICIPATING.has(code)) delete monthData[pid][d];
+          }
+        }
+        render();
+        closeModal();
+        toast("已清空排班（保留假期/停排）");
+      };
+    }
+  });
+};
+document.getElementById("resetAll").onclick = () => {
+  showModal({
+    title: "⚠️ 重置所有数据",
+    body: `
+      <p style="margin-top:0;color:var(--danger);font-weight:600;">此操作将清除所有月份的排班数据！</p>
+      <p>选择重置方式：</p>
+      <div class="field">
+        <label><input type="radio" name="resetMode" value="seed" checked /> 恢复到初始排班（SEED baseline）</label>
+      </div>
+      <div class="field">
+        <label><input type="radio" name="resetMode" value="empty" /> 完全清空（丢失所有数据）</label>
+      </div>
+      <p style="font-size:11px;color:var(--muted);margin-bottom:0;">提示：重置前建议先用「导出」备份当前数据。</p>
+    `,
+    foot: `
+      <button class="btn" id="resetCancel">取消</button>
+      <button class="btn danger" id="resetConfirm">确认重置</button>
+    `,
+    onOpen: () => {
+      document.getElementById("resetCancel").onclick = closeModal;
+      document.getElementById("resetConfirm").onclick = () => {
+        pushUndo();
+        const mode = document.querySelector('input[name="resetMode"]:checked')?.value || 'seed';
+        localStorage.removeItem(LS_KEY);
+        if(mode === "empty"){
+          state = { months: {}, staff: JSON.parse(JSON.stringify(DEFAULT_STAFF)), config: {} };
+          toast("已重置到出厂默认");
+        } else {
+          state = JSON.parse(JSON.stringify(SEED_STATE));
+          toast("已恢复到 SEED baseline");
+        }
+        saveState();
+        render();
+        closeModal();
+      };
+    }
+  });
+};
+document.getElementById("autoGen").onclick = () => {
+  if(!confirm("自动初排会按分组规则填入空白格（默认班次），\n不会覆盖你已排的任何班次（休/AL/离/补/停 全部保留）。\n\n确定继续？")) return;
+  pushUndo();
+  autoGenerate();
+  toast("已填空格（未覆盖已排）");
+};
+
+/* =========================================================
+   Auto generate: greedy fill by rules
+   ========================================================= */
+function autoGenerate(){
+  const {y,m} = cursor;
+  const days = daysInMonth(y,m);
+  const monthData = ensureMonth(y,m);
+  // For each person, do not overwrite existing entries (respect AL/OFF/TO/manual fills)
+  const staff = state.staff;
+
+  // group members
+  const groupA = staff.filter(p => p.group === "A");
+  const groupB = staff.filter(p => p.group === "B");
+  const night  = staff.filter(p => p.group === "NIGHT");
+  const flex   = staff.filter(p => p.group === "FLEX");
+
+  // rotation counters for A / B / flex — used across the whole month
+  let idxA = 0, idxB = 0, idxFlex = 0;
+  // per-person consecutive on-duty counter
+  const consec = Object.fromEntries(staff.map(p => [p.id, 0]));
+  // per-person "weekly rest count" per week key
+  const weekRest = {};
+
+  for(let d=1; d<=days; d++){
+    const dt = new Date(y,m,d);
+    const dateStr = fmtDate(y,m,d);
+    const rest = isRestDay(dateStr, dt);
+    const wkStart = new Date(dt); wkStart.setDate(dt.getDate() - dt.getDay());
+    const wkey = wkStart.toISOString().slice(0,10);
+    if(!weekRest[wkey]) weekRest[wkey] = Object.fromEntries(staff.map(p => [p.id, 0]));
+
+    // helper to set if not already set
+    const set = (pid, code) => {
+      if(!monthData[pid]) monthData[pid] = {};
+      if(monthData[pid][d] !== undefined) return; // manual/existing
+      const staffP = staff.find(s => s.id === pid);
+      if(!staffP) return;
+      if(!isPersonActive(staffP, dateStr)) return;
+      monthData[pid][d] = code;
+    };
+
+    // Any person with a fixed shift → assign it (won't overwrite manual entries)
+    for(const p of staff){
+      if(p.fixed) set(p.id, p.fixed);
+    }
+
+    // Group A: one N one E on weekdays; both WE/WL rotating on weekend
+    if(groupA.length === 2){
+      const a1 = groupA[idxA % 2], a2 = groupA[(idxA+1) % 2];
+      if(!rest){
+        set(a1.id, "N");
+        set(a2.id, "E");
+      } else {
+        // Weekend: one 12h early, one rest (rotate)
+        set(a1.id, "WE");
+        // a2 rests (leave empty)
+      }
+    }
+    // Group B: similar
+    if(groupB.length === 2){
+      const b1 = groupB[idxB % 2], b2 = groupB[(idxB+1) % 2];
+      if(!rest){
+        set(b1.id, "E");
+        set(b2.id, "N");
+      } else {
+        set(b1.id, "WE");
+      }
+    }
+    // Night group: on workdays → L, on weekends/holidays → WL
+    for(const p of night){
+      if(!rest) set(p.id, "L"); else set(p.id, "WL");
+    }
+    // Flex group: fill Standby / mid coverage / weekend late coverage; else leave rest
+    // Simple pattern: alternate between M and SB and rest
+    for(let i=0; i<flex.length; i++){
+      const p = flex[i];
+      // Skip 客服 C (placeholder) — leave for user
+      if(p.id === "c-c") continue;
+      if(rest){
+        // Provide WL if group A/B WL not filled: rotate
+        if((d + i) % 3 === 0) set(p.id, "WL");
+      } else {
+        const pattern = (d + i) % 4;
+        if(pattern === 0) set(p.id, "M");
+        else if(pattern === 1) set(p.id, "SB");
+        // else leave empty as rest
+      }
+    }
+
+    // rotate groups weekly
+    if(!rest && (dt.getDay() === 1)){
+      idxA++; idxB++; idxFlex++;
+    }
+  }
+
+  // Ensure each non-exempt person has ≥2 rest days per week: naive check — if any week has <2, clear one day to rest
+  // (This is a heuristic; the user can then adjust)
+  for(const p of staff){
+    if(p.exempt || p.fixed) continue;
+    const shifts = monthData[p.id] || {};
+    const weeks = {};
+    for(let d=1; d<=days; d++){
+      const dt = new Date(y,m,d);
+      const wkStart = new Date(dt); wkStart.setDate(dt.getDate() - dt.getDay());
+      const wkey = wkStart.toISOString().slice(0,10);
+      if(!weeks[wkey]) weeks[wkey] = [];
+      weeks[wkey].push(d);
+    }
+    for(const wk of Object.values(weeks)){
+      let rest = wk.filter(d => !shifts[d]).length;
+      if(rest >= 2) continue;
+      // Try to drop some non-critical days (SB, M) first
+      for(const d of wk){
+        if(rest >= 2) break;
+        const code = shifts[d];
+        if(code === "SB" || code === "M"){
+          delete shifts[d];
+          rest++;
+        }
+      }
+    }
+    monthData[p.id] = shifts;
+  }
+
+  render();
+}
+
+/* =========================================================
+   Import / Export
+   ========================================================= */
+document.getElementById("exportBtn").onclick = () => openExport();
+document.getElementById("importBtn").onclick = () => openImport();
+
+function openExport(){
+  const {y,m} = cursor;
+  const days = daysInMonth(y,m);
+  const monthData = state.months[ymKey(y,m)] || {};
+  // TSV: header row + person rows
+  const header = ["人员", ...Array.from({length:days},(_,i)=>String(i+1)), "上班日数", "工时", "超时", "AL"];
+  const rows = [header.join("\t")];
+  for(const p of state.staff){
+    const shifts = monthData[p.id] || {};
+    const s = computePersonStats(p,y,m);
+    const cols = [p.name];
+    for(let d=1; d<=days; d++){
+      const code = shifts[d];
+      cols.push(code ? SHIFTS[code].label : (p.exempt ? "—" : ""));
+    }
+    cols.push(p.exempt ? "—" : String(s.onDuty));
+    cols.push(p.exempt ? "" : String(s.hours));
+    cols.push(p.exempt ? "" : String(s.overtime || ""));
+    cols.push(p.exempt ? "" : String(s.al || ""));
+    rows.push(cols.join("\t"));
+  }
+  const tsv = rows.join("\n");
+  const json = JSON.stringify({ month: ymKey(y,m), staff: state.staff, data: monthData, shifts: SHIFTS, shiftOrder: SHIFT_ORDER }, null, 2);
+
+  showModal({
+    title: `导出 · ${y}-${String(m+1).padStart(2,"0")}`,
+    body: `
+      <div class="field">
+        <label>粘贴到飞书表格（TSV，选中 A1 后 Cmd/Ctrl-V）</label>
+        <textarea id="expTsv" readonly>${escapeHtml(tsv)}</textarea>
+      </div>
+      <div class="field">
+        <label>JSON 备份（可再次导入还原）</label>
+        <textarea id="expJson" readonly>${escapeHtml(json)}</textarea>
+      </div>`,
+    foot: `
+      <button class="btn" id="copyTsv">复制 TSV</button>
+      <button class="btn" id="copyMd">复制 Markdown</button>
+      <button class="btn" id="copyJson">复制 JSON</button>
+      <button class="btn" id="downloadTsv">下载 .tsv</button>
+      <button class="btn" id="downloadJson">下载 .json</button>
+      <button class="btn" id="downloadCsv">下载 Base CSV</button>
+      <button class="btn" id="exportImg">导出图片</button>
+      <button class="btn primary" id="closeExport">完成</button>
+    `,
+    onOpen: () => {
+      document.getElementById("copyTsv").onclick = () => { navigator.clipboard.writeText(tsv); toast("已复制 TSV"); };
+      document.getElementById("copyMd").onclick = () => { navigator.clipboard.writeText(buildMarkdownRoster()); toast("已复制 Markdown"); };
+      document.getElementById("copyJson").onclick = () => { navigator.clipboard.writeText(json); toast("已复制 JSON"); };
+      document.getElementById("downloadTsv").onclick = () => download(`roster-${ymKey(y,m)}.tsv`, tsv);
+      document.getElementById("downloadJson").onclick = () => download(`roster-${ymKey(y,m)}.json`, json);
+      document.getElementById("downloadCsv").onclick = () => { download(`roster-base-${ymKey(y,m)}.csv`, buildBaseCsv()); toast("已下载 Base CSV"); };
+      document.getElementById("exportImg").onclick = () => exportAsImage();
+      document.getElementById("closeExport").onclick = closeModal;
+    }
+  });
+}
+
+function buildBaseCsv(){
+  const {y,m} = cursor;
+  const days = daysInMonth(y,m);
+  const monthData = state.months[ymKey(y,m)] || {};
+  const weekdays = ["日","一","二","三","四","五","六"];
+  const staffMap = {};
+  for(const p of state.staff) staffMap[p.id] = p.name;
+
+  const SHIFT_COL = {
+    N:"常班", AD:"常班", E:"早班", WE:"早班", M:"中班",
+    L:"晚班", WL:"晚班", SB:"当值人员",
+    AL:"休假人员", HAM:"休假人员", HAP:"休假人员", HAL:"休假人员", MAL:"休假人员", AAL:"休假人员", OFF:"休假人员", TO:"休假人员"
+  };
+
+  const csvRows = ["日期,星期,常班,早班,中班,晚班,当值人员,休假人员"];
+  for(let d=1; d<=days; d++){
+    const dt = new Date(y, m, d);
+    const dateStr = `${y}/${String(m+1).padStart(2,"0")}/${String(d).padStart(2,"0")}`;
+    const wd = weekdays[dt.getDay()];
+    const cols = { "常班":[], "早班":[], "中班":[], "晚班":[], "当值人员":[], "休假人员":[] };
+
+    for(const [pid, shifts] of Object.entries(monthData)){
+      const code = shifts[String(d)];
+      if(!code) continue;
+      const colName = SHIFT_COL[code];
+      if(colName && cols[colName]){
+        cols[colName].push(staffMap[pid] || pid);
+      }
+    }
+
+    const escapeCsvField = (v) => v.includes(",") ? `"${v}"` : v;
+    csvRows.push([
+      dateStr, wd,
+      escapeCsvField(cols["常班"].join(", ")),
+      escapeCsvField(cols["早班"].join(", ")),
+      escapeCsvField(cols["中班"].join(", ")),
+      escapeCsvField(cols["晚班"].join(", ")),
+      escapeCsvField(cols["当值人员"].join(", ")),
+      escapeCsvField(cols["休假人员"].join(", ")),
+    ].join(","));
+  }
+  return "﻿" + csvRows.join("\n");
+}
+
+async function exportAsImage(){
+  const gridEl = document.querySelector(".scheduler-page .grid");
+  if(!gridEl){ toast("找不到排班表格"); return; }
+  toast("正在生成图片…");
+  try {
+    const canvas = await html2canvas(gridEl, {
+      scale: 2,
+      backgroundColor: "#ffffff",
+      logging: false,
+    });
+    const link = document.createElement("a");
+    link.download = `roster-${ymKey(cursor.y, cursor.m)}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+    toast("图片已下载");
+  } catch(e){
+    toast("导出图片失败：" + e.message);
+  }
+}
+
+function openImport(){
+  showModal({
+    title: `导入 · ${cursor.y}-${String(cursor.m+1).padStart(2,"0")}`,
+    body: `
+      <p style="color:var(--muted);margin-top:0;">粘贴 JSON 备份或飞书表格 TSV（首行为日期表头 1-N，第一列为人员姓名）。仅覆盖当前月份。</p>
+      <textarea id="impText" placeholder="粘贴内容…"></textarea>
+    `,
+    foot: `
+      <button class="btn" id="closeImport">取消</button>
+      <button class="btn primary" id="doImport">导入</button>
+    `,
+    onOpen: () => {
+      document.getElementById("closeImport").onclick = closeModal;
+      document.getElementById("doImport").onclick = () => {
+        const txt = document.getElementById("impText").value.trim();
+        if(!txt){ toast("内容为空"); return; }
+        pushUndo();
+        // Try JSON first
+        try {
+          const j = JSON.parse(txt);
+          if(j.data && j.month){
+            state.months[j.month] = j.data;
+            const [yy,mm] = j.month.split("-").map(Number);
+            cursor.y = yy; cursor.m = mm-1;
+            if(j.staff && Array.isArray(j.staff)) state.staff = j.staff;
+            if(j.shifts && typeof j.shifts === "object"){ SHIFTS = j.shifts; state.shifts = j.shifts; }
+            if(Array.isArray(j.shiftOrder) && j.shiftOrder.length){ SHIFT_ORDER = j.shiftOrder; state.shiftOrder = j.shiftOrder; }
+            saveState(); render(); closeModal(); toast("已导入 JSON");
+            return;
+          }
+        } catch {}
+        // Try TSV
+        const rows = txt.split(/\r?\n/).filter(r=>r.trim());
+        if(rows.length < 2){ toast("格式无法识别"); return; }
+        const header = rows[0].split(/\t|,/);
+        const dayCols = [];
+        for(let i=0;i<header.length;i++){
+          const n = parseInt(header[i], 10);
+          if(!isNaN(n) && n>=1 && n<=31) dayCols.push({idx:i, day:n});
+        }
+        if(!dayCols.length){ toast("表头未识别到日期列"); return; }
+        // shift label -> code
+        const labelMap = Object.fromEntries(SHIFT_ORDER.map(c => [SHIFTS[c].label, c]));
+        const monthData = ensureMonth(cursor.y, cursor.m);
+        let matched = 0;
+        for(let r=1; r<rows.length; r++){
+          const cols = rows[r].split(/\t|,/);
+          const name = (cols[0]||"").trim();
+          const staff = state.staff.find(s => s.name === name);
+          if(!staff) continue;
+          matched++;
+          if(!monthData[staff.id]) monthData[staff.id] = {};
+          for(const dc of dayCols){
+            const raw = (cols[dc.idx]||"").trim();
+            const code = labelMap[raw];
+            if(code) monthData[staff.id][dc.day] = code;
+            else if(!raw) delete monthData[staff.id][dc.day];
+          }
+        }
+        saveState(); render(); closeModal(); toast(`已导入 ${matched} 人`);
+      };
+    }
+  });
+}
+
+function download(name, content){
+  const blob = new Blob([content], {type: "text/plain;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* =========================================================
+   Staff editor
+   ========================================================= */
+document.getElementById("staffBtn").onclick = () => openStaff();
+window.openStaff = openStaff; // expose for click-name handlers
+document.getElementById("shiftBtn").onclick = () => openShiftEditor();
+document.getElementById("editShiftFromLegend").onclick = () => openShiftEditor();
+const undoBtnEl = document.getElementById("undoBtn");
+if(undoBtnEl){ undoBtnEl.onclick = () => undo(); undoBtnEl.classList.add("disabled"); }
+
+/* =========================================================
+   Shift editor (labels / times / hours)
+   ========================================================= */
+function openShiftEditor(){
+  showModal({
+    title: "班次配置",
+    body: `
+      <p style="color:var(--muted);margin-top:0;">修改后立即生效，会保存到浏览器本地。<b>时间会自动推导工时</b>（如 09:00–18:00 = 9h，跨零点的 17:00–02:00 也支持）；工时可手动覆盖（SB/AL/LV 等设 0）。可以删除用不到的班次、添加新班次。</p>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead style="background:var(--surface-2);">
+          <tr>
+            <th style="text-align:left;padding:6px 8px;">当前</th>
+            <th style="text-align:left;padding:6px 8px;">代码</th>
+            <th style="text-align:left;padding:6px 8px;">标签</th>
+            <th style="text-align:left;padding:6px 8px;">时间</th>
+            <th style="text-align:left;padding:6px 8px;">工时</th>
+            <th style="text-align:left;padding:6px 8px;">底/字</th>
+            <th style="text-align:left;padding:6px 8px;">说明</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="shiftRows"></tbody>
+      </table>
+      <div style="margin-top:12px;">
+        <button class="btn" id="addShiftBtn">+ 添加班次</button>
+      </div>
+    `,
+    foot: `
+      <button class="btn" id="closeShift">取消</button>
+      <button class="btn" id="restoreShift">恢复默认</button>
+      <button class="btn primary" id="saveShift">保存</button>
+    `,
+    onOpen: () => {
+      renderShiftRows();
+      document.getElementById("addShiftBtn").onclick = () => {
+        const code = (prompt("输入新班次代码（2-4 位大写字母/数字，如 SL 病假、PL 有薪假）:") || "").trim().toUpperCase();
+        if(!code) return;
+        if(!/^[A-Z0-9]{1,6}$/.test(code)){ toast("代码格式无效"); return; }
+        if(SHIFTS[code]){ toast(`代码 ${code} 已存在`); return; }
+        // Assign a color from palette by rotating hue
+        const palette = [
+          {bg:"#f3e8ff", fg:"#6b21a8"},
+          {bg:"#dcfce7", fg:"#166534"},
+          {bg:"#ffedd5", fg:"#9a3412"},
+          {bg:"#e0f2fe", fg:"#075985"},
+          {bg:"#fee2e2", fg:"#991b1b"},
+          {bg:"#f5f5f4", fg:"#44403c"},
+        ];
+        const color = palette[SHIFT_ORDER.length % palette.length];
+        SHIFTS[code] = { label: code.slice(0,2), hours: 0, time: "", desc: "", bg: color.bg, fg: color.fg };
+        SHIFT_ORDER.push(code);
+        // Ensure allowed for all staff
+        for(const p of state.staff){
+          if(p.allowed && !p.allowed.includes(code)) p.allowed.push(code);
+        }
+        renderShiftRows();
+      };
+      document.getElementById("closeShift").onclick = closeModal;
+      document.getElementById("restoreShift").onclick = () => {
+        if(!confirm("恢复班次默认值？会丢失自定义班次和颜色。")) return;
+        SHIFTS = JSON.parse(JSON.stringify(DEFAULT_SHIFTS_SNAPSHOT));
+        SHIFT_ORDER = DEFAULT_SHIFT_ORDER_SNAPSHOT.slice();
+        delete state.shifts; delete state.shiftOrder; delete state.shiftOverride;
+        saveState(); closeModal(); render(); toast("已恢复默认");
+      };
+      document.getElementById("saveShift").onclick = () => {
+        pushUndo();
+        for(const tr of document.querySelectorAll("#shiftRows tr")){
+          const code = tr.dataset.code;
+          if(!SHIFTS[code]) continue;
+          const label = tr.querySelector(".sf-label").value.trim() || SHIFTS[code].label;
+          const time  = tr.querySelector(".sf-time").value.trim();
+          const hours = Number(tr.querySelector(".sf-hours").value) || 0;
+          const bg    = tr.querySelector(".sf-bg").value || SHIFTS[code].bg;
+          const fg    = tr.querySelector(".sf-fg").value || SHIFTS[code].fg;
+          const desc  = tr.querySelector(".sf-desc").value.trim();
+          SHIFTS[code] = { label, time, hours, desc, bg, fg };
+        }
+        state.shifts = SHIFTS;
+        state.shiftOrder = SHIFT_ORDER;
+        delete state.shiftOverride; // fully migrated
+        saveState(); closeModal(); render(); toast("班次已保存");
+      };
+    }
+  });
+}
+
+function renderShiftRows(){
+  const tbody = document.getElementById("shiftRows");
+  if(!tbody) return;
+  tbody.innerHTML = SHIFT_ORDER.map(code => {
+    const s = SHIFTS[code];
+    return `
+      <tr data-code="${code}">
+        <td style="padding:6px 8px;">${shiftPill(code, "min-width:32px;height:22px;")}</td>
+        <td style="padding:6px 8px;color:var(--muted);font-size:11px;">${escapeHtml(code)}</td>
+        <td style="padding:6px 8px;"><input type="text" class="sf-label" value="${escapeHtml(s.label)}" style="width:52px;" /></td>
+        <td style="padding:6px 8px;"><input type="text" class="sf-time"  value="${escapeHtml(s.time||'')}" placeholder="09:00–18:00" style="width:140px;" /></td>
+        <td style="padding:6px 8px;"><input type="number" class="sf-hours" value="${s.hours}" min="0" max="24" step="0.5" style="width:56px;" /></td>
+        <td style="padding:6px 8px;white-space:nowrap;">
+          <input type="color" class="sf-bg" value="${s.bg}" title="底色" style="width:26px;height:22px;border:1px solid var(--border);padding:0;vertical-align:middle;" />
+          <input type="color" class="sf-fg" value="${s.fg}" title="字色" style="width:26px;height:22px;border:1px solid var(--border);padding:0;vertical-align:middle;margin-left:2px;" />
+        </td>
+        <td style="padding:6px 8px;"><input type="text" class="sf-desc" value="${escapeHtml(s.desc||'')}" style="width:100%;min-width:160px;" /></td>
+        <td style="padding:6px 8px;"><button class="link-btn sf-del" style="color:var(--danger);">删除</button></td>
+      </tr>`;
+  }).join("");
+  // Attach handlers
+  for(const tr of tbody.querySelectorAll("tr")){
+    const code = tr.dataset.code;
+    const timeInput = tr.querySelector(".sf-time");
+    const hoursInput = tr.querySelector(".sf-hours");
+    const bgInput = tr.querySelector(".sf-bg");
+    const fgInput = tr.querySelector(".sf-fg");
+    const labelInput = tr.querySelector(".sf-label");
+    const preview = tr.querySelector(".pill");
+    const syncHours = () => {
+      const h = parseTimeToHours(timeInput.value);
+      if(h !== null) hoursInput.value = h;
+    };
+    timeInput.addEventListener("input", syncHours);
+    timeInput.addEventListener("blur", syncHours);
+    const syncPreview = () => {
+      if(preview){
+        preview.style.background = bgInput.value;
+        preview.style.color = fgInput.value;
+        preview.textContent = labelInput.value || code;
+      }
+    };
+    bgInput.addEventListener("input", syncPreview);
+    fgInput.addEventListener("input", syncPreview);
+    labelInput.addEventListener("input", syncPreview);
+    tr.querySelector(".sf-del").onclick = () => {
+      const usageCount = countShiftUsage(code);
+      let msg = `删除班次「${SHIFTS[code].label} (${code})」？`;
+      if(usageCount > 0) msg += `\n有 ${usageCount} 格排班在使用，删除后会一并清除这些格子。`;
+      if(!confirm(msg)) return;
+      pushUndo();
+      // Purge usage across all months
+      for(const monthKey of Object.keys(state.months)){
+        const md = state.months[monthKey];
+        for(const pid of Object.keys(md)){
+          for(const d of Object.keys(md[pid])){
+            if(md[pid][d] === code) delete md[pid][d];
+          }
+        }
+      }
+      delete SHIFTS[code];
+      const idx = SHIFT_ORDER.indexOf(code);
+      if(idx >= 0) SHIFT_ORDER.splice(idx, 1);
+      renderShiftRows();
+    };
+  }
+}
+function countShiftUsage(code){
+  let n = 0;
+  for(const monthKey of Object.keys(state.months)){
+    const md = state.months[monthKey];
+    for(const pid of Object.keys(md)){
+      for(const d of Object.keys(md[pid])){
+        if(md[pid][d] === code) n++;
+      }
+    }
+  }
+  return n;
+}
+function openStaff(focusId){
+  const rows = state.staff.map((p,i) => `
+    <tr data-i="${i}" data-pid="${p.id}">
+      <td><input type="text" class="s-name" value="${escapeHtml(p.name)}" /></td>
+      <td><input type="text" class="s-role" value="${escapeHtml(p.role||'')}" /></td>
+      <td>
+        <select class="s-group">
+          ${["LEAD","API","A","B","NIGHT","FLEX"].map(g => `<option value="${g}" ${g===p.group?"selected":""}>${g}</option>`).join("")}
+        </select>
+      </td>
+      <td><label style="font-size:11px;" title="整行永久不参与排班（如已离职）。想让某几天不排班请用右侧的入职/离职字段"><input type="checkbox" class="s-exempt" ${p.exempt?"checked":""}/> 永久停用</label></td>
+      <td>
+        <select class="s-fixed">
+          <option value="">—</option>
+          ${SHIFT_ORDER.map(c => `<option value="${c}" ${c===p.fixed?"selected":""}>${SHIFTS[c].label} ${SHIFTS[c].time}</option>`).join("")}
+        </select>
+      </td>
+      <td>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <input type="date" class="s-start" value="${escapeHtml(p.startDate||'')}" title="该日期起可排班（此前置灰）" style="width:130px;" />
+          <input type="date" class="s-end"   value="${escapeHtml(p.endDate  ||'')}" title="该日期止可排班（此后置灰）" style="width:130px;" />
+        </div>
+      </td>
+      <td><input type="text" class="s-note" value="${escapeHtml(p.note||'')}" style="width:100%;" /></td>
+      <td><button class="link-btn s-del" style="color:var(--danger);">删除</button></td>
+    </tr>`).join("");
+  showModal({
+    title: "人员配置",
+    body: `
+      <p style="color:var(--muted);margin-top:0;">修改人员、角色、组别、固定班次。改动影响后续初排和校验。</p>
+      <div style="padding:8px 10px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;font-size:12px;color:var(--text-2);margin-bottom:12px;line-height:1.55;">
+        <b>怎么让某几天不排班？</b>
+        用「入职」「离职」两个日期字段，例如 8/1–9 号不排：入职填 <b>8/10</b>；20 号后不排：离职填 <b>8/19</b>。<br>
+        <b>永久停用</b>（整个人不参与排班）才勾左边的复选框，那会把整行降色。
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead><tr>
+          <th style="text-align:left;padding:6px;">姓名</th>
+          <th style="text-align:left;padding:6px;">角色</th>
+          <th style="text-align:left;padding:6px;">组</th>
+          <th style="text-align:left;padding:6px;">永久停用</th>
+          <th style="text-align:left;padding:6px;">固定班</th>
+          <th style="text-align:left;padding:6px;">入职 / 离职</th>
+          <th style="text-align:left;padding:6px;">备注</th>
+          <th></th>
+        </tr></thead>
+        <tbody id="staffRows">${rows}</tbody>
+      </table>
+      <button class="btn" id="addStaff" style="margin-top:12px;">+ 新增人员</button>
+    `,
+    foot: `
+      <button class="btn" id="closeStaff">取消</button>
+      <button class="btn" id="restoreStaff">恢复默认</button>
+      <button class="btn primary" id="saveStaff">保存</button>
+    `,
+    onOpen: () => {
+      document.getElementById("closeStaff").onclick = closeModal;
+      document.getElementById("addStaff").onclick = () => {
+        const newP = { id: "n"+Date.now(), name:"新成员", role:"客服", group:"FLEX", allowed: SHIFT_ORDER, note:"" };
+        state.staff.push(newP);
+        closeModal(); openStaff(newP.id);
+      };
+      // Focus and select target row's name input
+      if(focusId){
+        const tr = document.querySelector(`#staffRows tr[data-pid="${focusId}"]`);
+        if(tr){
+          tr.style.background = "#fef9c3";
+          setTimeout(() => tr.style.background = "", 1400);
+          const inp = tr.querySelector(".s-name");
+          if(inp){ inp.focus(); inp.select(); tr.scrollIntoView({block:"center", behavior:"smooth"}); }
+        }
+      }
+      document.getElementById("restoreStaff").onclick = () => {
+        if(!confirm("恢复默认人员配置？当前配置将丢失。")) return;
+        state.staff = JSON.parse(JSON.stringify(DEFAULT_STAFF));
+        saveState(); closeModal(); openStaff();
+      };
+      document.getElementById("saveStaff").onclick = () => {
+        pushUndo();
+        const rowsEls = document.querySelectorAll("#staffRows tr");
+        const newStaff = [];
+        for(const r of rowsEls){
+          const i = +r.dataset.i;
+          const orig = state.staff[i];
+          if(!orig) continue;
+          orig.name = r.querySelector(".s-name").value.trim() || orig.name;
+          orig.role = r.querySelector(".s-role").value.trim();
+          orig.group = r.querySelector(".s-group").value;
+          orig.exempt = r.querySelector(".s-exempt").checked;
+          const fx = r.querySelector(".s-fixed").value;
+          if(fx) orig.fixed = fx; else delete orig.fixed;
+          const sd = r.querySelector(".s-start").value;
+          const ed = r.querySelector(".s-end").value;
+          if(sd) orig.startDate = sd; else delete orig.startDate;
+          if(ed) orig.endDate   = ed; else delete orig.endDate;
+          orig.note = r.querySelector(".s-note").value.trim();
+          newStaff.push(orig);
+        }
+        state.staff = newStaff;
+        saveState(); closeModal(); render(); toast("人员已更新");
+      };
+      // per-row delete
+      document.querySelectorAll(".s-del").forEach(btn => {
+        btn.onclick = () => {
+          const tr = btn.closest("tr");
+          const i = +tr.dataset.i;
+          if(!confirm(`删除 ${state.staff[i].name}？`)) return;
+          pushUndo();
+          state.staff.splice(i,1);
+          closeModal(); openStaff();
+        };
+      });
+    }
+  });
+}
+
+/* =========================================================
+   Zoom controls — 缩放排班表格
+   ========================================================= */
+let zoomLevel = 100;
+const ZOOM_STEP = 10;
+const ZOOM_MIN = 50;
+const ZOOM_MAX = 150;
+
+function applyZoom(){
+  const gridWrap = document.querySelector(".scheduler-page .grid-wrap");
+  if(!gridWrap) return;
+  gridWrap.style.transform = `scale(${zoomLevel / 100})`;
+  gridWrap.style.transformOrigin = "top left";
+  gridWrap.style.width = `${10000 / zoomLevel}%`;
+  document.getElementById("zoomLabel").textContent = `${zoomLevel}%`;
+}
+document.getElementById("zoomIn").onclick = () => {
+  if(zoomLevel < ZOOM_MAX){ zoomLevel += ZOOM_STEP; applyZoom(); }
+};
+document.getElementById("zoomOut").onclick = () => {
+  if(zoomLevel > ZOOM_MIN){ zoomLevel -= ZOOM_STEP; applyZoom(); }
+};
+document.getElementById("zoomReset").onclick = () => {
+  zoomLevel = 100; applyZoom();
+};
+function buildMarkdownRoster(){
+  const {y,m} = cursor;
+  const days = daysInMonth(y,m);
+  const monthData = state.months[ymKey(y,m)] || {};
+  const header = ["人员", ...Array.from({length:days},(_,i)=>String(i+1))];
+  const sep = header.map(()=>"---");
+  const rows = state.staff.map(p => {
+    const shifts = monthData[p.id] || {};
+    const cols = [p.name];
+    for(let d=1; d<=days; d++){
+      const code = shifts[d];
+      cols.push(code ? SHIFTS[code].label : (p.exempt ? "—" : " "));
+    }
+    return "|" + cols.join("|") + "|";
+  });
+  return `**${y}-${String(m+1).padStart(2,"0")} 客服排班**\n\n|${header.join("|")}|\n|${sep.join("|")}|\n${rows.join("\n")}`;
+}
+
+/* =========================================================
+   Modal helpers
+   ========================================================= */
+const modalBg = document.getElementById("modalBg");
+const modalTitle = document.getElementById("modalTitle");
+const modalBody = document.getElementById("modalBody");
+const modalFoot = document.getElementById("modalFoot");
+document.getElementById("modalClose").onclick = closeModal;
+modalBg.addEventListener("click", (e) => { if(e.target === modalBg) closeModal(); });
+function showModal({title, body, foot, onOpen}){
+  modalTitle.textContent = title;
+  modalBody.innerHTML = body;
+  modalFoot.innerHTML = foot || "";
+  modalBg.classList.add("open");
+  if(onOpen) onOpen();
+}
+function closeModal(){ modalBg.classList.remove("open"); }
+
+/* =========================================================
+   Toast
+   ========================================================= */
+const toastEl = document.getElementById("toast");
+let toastTimer;
+function toast(msg){
+  toastEl.textContent = msg;
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 1600);
+}
+
+/* =========================================================
+   Init
+   ========================================================= */
+render();
+
+getSchedulerState().then(res => {
+  if (res && res.data && typeof res.data === 'object') {
+    syncing = true;
+    const serverState = res.data;
+    if (serverState.months) state.months = serverState.months;
+    if (serverState.staff) state.staff = serverState.staff;
+    if (serverState.config) state.config = serverState.config;
+    if (serverState.shifts) { state.shifts = serverState.shifts; SHIFTS = serverState.shifts; }
+    if (serverState.shiftOrder) { state.shiftOrder = serverState.shiftOrder; SHIFT_ORDER = serverState.shiftOrder.filter(c => SHIFTS[c]); }
+    if (serverState.viewMode) state.viewMode = serverState.viewMode;
+    localStorage.setItem(LS_KEY, JSON.stringify(state));
+    render();
+    syncing = false;
+  }
+}).catch(() => {});
+}
+
+export function destroyScheduler() {
+  if (keydownHandler) {
+    document.removeEventListener("keydown", keydownHandler)
+    keydownHandler = null
+  }
+  if (mouseupHandler) {
+    document.removeEventListener("mouseup", mouseupHandler)
+    mouseupHandler = null
+  }
+  if (saveTimer) {
+    clearTimeout(saveTimer)
+    saveTimer = null
+  }
+  undoStack = []
+}

@@ -1,0 +1,47 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.env
+*.db
+
+# ===== Node =====
+node_modules/
+dist/
+.output/
+.nuxt/
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ===== Logs =====
+*.log
+npm-debug.log*
+
+# ===== Runtime =====
+uploads/
+*.sqlite3
+
+# ===== Claude Code 本地配置（含绝对路径，不提交）=====
+.claude/settings.local.json
+
+# ===== 以下文件必须纳入版本管理，不要忽略 =====
+# .claude/              ← 规则文件，必须提交
+# .claude/settings.json ← 权限配置，必须提交
+# CLAUDE.md             ← 入口规范，必须提交
+# package-lock.json     ← 锁定依赖版本，必须提交
