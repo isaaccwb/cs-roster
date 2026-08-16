@@ -1,0 +1,6 @@
+services:
+  app:
+    build: .
+    ports: ["8000:8000"]
+    environment: [SECRET_KEY=demo-secret-key, JWT_SECRET_KEY=demo-jwt-secret]
+    volumes: [./backend/uploads:/app/backend/uploads]
